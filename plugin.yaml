@@ -1,0 +1,39 @@
+name: naonao
+label: NaoNao
+kind: platform
+version: 1.0.0
+description: >
+  NaoNao messaging platform adapter for Hermes Agent.
+  Connects with a NaoNao Bot Token, receives message.bot_mention and
+  command.invoked on the Public Bot API v1 Gateway, and sends text replies
+  through the Bot API.
+  Hermes Gateway runs the agent. This plugin does not call the Hermes HTTP API.
+author: NaoNao
+license: MIT
+homepage: https://naonaoai.com
+# Installed into the Hermes gateway dependency environment by `pm.sync_venv`
+# when this plugin is enabled. Not installed into a developer venv.
+# websockets>=13,<16: connect(max_size, open_timeout). Hermes gateway runtime is
+# websockets 15.0.1. 16+ is published but not the runtime this adapter was verified on.
+# python-socks>=2,<4: the import websockets 15 uses for SOCKS. Current release is 3.1.1.
+python_dependencies:
+  - websockets>=13,<16
+  - python-socks>=2,<4
+requires_env:
+  - name: NAONAO_BOT_TOKEN
+    description: "NaoNao Bot Token (nn_bot_). Secret. Grants the Bot's installed permissions."
+    prompt: "NaoNao Bot Token"
+    password: true
+optional_env:
+  - name: NAONAO_API_BASE
+    description: "NaoNao REST API base URL (default https://naonaoai.com)"
+    prompt: "NaoNao API Base URL"
+    password: false
+  - name: NAONAO_ALLOWED_USERS
+    description: "Comma-separated stable NaoNao actor ids allowed to reach the agent"
+    prompt: "NaoNao allowed user ids"
+    password: false
+  - name: NAONAO_ALLOW_ALL_USERS
+    description: "Set true to admit every NaoNao sender with a stable actor id"
+    prompt: "Allow all NaoNao users (true/false)"
+    password: false

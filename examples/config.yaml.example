@@ -1,0 +1,13 @@
+# Minimal Hermes config. The Bot Token is a secret.
+# Save it with: hermes config set NAONAO_BOT_TOKEN nn_bot_xxxxxxxxxxxxxxxxx
+# That writes ~/.hermes/.env. Do not commit the token.
+#
+# Optional, only if you are not using https://naonaoai.com:
+#   hermes config set NAONAO_API_BASE https://naonaoai.com
+#
+# Do not set NAONAO_HOME_CHANNEL. Use /sethome in NaoNao.
+# Do not add a bot id, application id, community id, or gateway URL.
+
+platforms:
+  naonao:
+    enabled: true
