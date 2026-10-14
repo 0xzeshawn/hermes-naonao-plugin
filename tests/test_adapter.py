@@ -1109,5 +1109,110 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
 
+class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    """Hermes must not preview-edit a create-only NaoNao channel."""
+
+    def _adapter(self):
+        posts = []
+
+        def handler(method, url, headers, body):
+            if str(url).endswith("/messages"):
+                posts.append(body)
+                return _Response(201, {"ok": True, "message": {"id": f"msg_{len(posts)}"}})
+            return _Response(200, {})
+
+        http = _Http(handler)
+        adapter = NaoNaoAdapter(
+            PlatformConfig(extra={"bot_token": "nn_bot_example", "api_base": "https://naonaoai.com"}),
+            http_factory=lambda: http,
+        )
+        adapter._http = http
+        adapter._posts = posts
+        return adapter
+
+    def _decide(self, adapter, *, interim):
+        from types import SimpleNamespace
+        from gateway.config import StreamingConfig
+        from gateway.run_turn import GatewayTurnMixin
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform("naonao"),
+            chat_id="community_a:channel_x",
+            chat_type="channel",
+            user_id="actor_1",
+        )
+        runner = SimpleNamespace(
+            config=SimpleNamespace(streaming=StreamingConfig(enabled=True)),
+            _delivery_adapter_for=lambda _source: adapter,
+        )
+        runner._build_stream_consumer_config = (
+            lambda source, scfg, adapter, on_missing_cursor: GatewayTurnMixin._build_stream_consumer_config(
+                runner, source, scfg, adapter, on_missing_cursor=on_missing_cursor,
+            )
+        )
+        ctx = SimpleNamespace(
+            mute_notification_reply=False,
+            streaming_tts_consumer_holder=[None],
+            scheduled_heartbeat=False,
+            interim_assistant_messages_enabled=interim,
+            user_config={},
+            resolve_display_setting=lambda _user_config, _platform_key, _setting: None,
+            stream_consumer_holder=[None],
+            source=source,
+            _status_thread_metadata=None,
+            progress_queue=None,
+            event_message_id="msg_user",
+            _run_still_current=lambda: True,
+        )
+        host = SimpleNamespace(_ctx=ctx, _runner=runner)
+        return TurnRunner._setup_stream_consumer(host, "naonao")
+
+    def test_editing_capability_is_false(self):
+        self.assertIs(NaoNaoAdapter.SUPPORTS_MESSAGE_EDITING, False)
+
+    def test_global_streaming_does_not_wire_preview_deltas(self):
+        adapter = self._adapter()
+        for interim in (False, True):
+            consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=interim)
+            self.assertIsNone(delta_cb)
+            if consumer is not None:
+                self.assertFalse(consumer.stream_deltas_enabled)
+                self.assertEqual(consumer.cfg.cursor, "")
+
+    async def test_one_trigger_sends_one_final_message(self):
+        adapter = self._adapter()
+        consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=False)
+        self.assertIsNone(consumer)
+        self.assertIsNone(delta_cb)
+        final = "测试成功"
+        result = await adapter.send(
+            "community_a:channel_x", final, metadata={"naonao_event_id": "evt_stream"},
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(adapter._posts, [{"content": final}])
+        self.assertNotIn("▉", final)
+        self.assertNotIn("▌", final)
+
+    async def test_deltas_do_not_create_messages_before_the_final(self):
+        adapter = self._adapter()
+        _consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=False)
+        pieces = ["我国古代文学中最", "早的诗集是诗经。", "后面是完整的长回复。"]
+        if delta_cb is not None:
+            for piece in pieces:
+                delta_cb(piece)
+            await asyncio.sleep(0)
+        final = "".join(pieces)
+        result = await adapter.send(
+            "community_a:channel_x", final, metadata={"naonao_event_id": "evt_long"},
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(len(adapter._posts), 1)
+        self.assertEqual(adapter._posts[0]["content"], final)
+        self.assertNotIn("▉", adapter._posts[0]["content"])
+        self.assertNotIn("▌", adapter._posts[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

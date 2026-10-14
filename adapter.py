@@ -98,6 +98,9 @@ class NaoNaoAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True
     supports_code_blocks = False
+    # Create-only platform. Hermes otherwise treats a missing flag as editable and
+    # posts a cursor preview, then a second final message when edit_message fails.
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: PlatformConfig, *, http_factory=None, ws_connect=None):
         super().__init__(config=config, platform=Platform("naonao"))

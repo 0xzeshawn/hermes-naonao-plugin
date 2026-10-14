@@ -4,7 +4,7 @@ NaoNao is a community and channel-based communication platform. This adapter con
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only.
+Text messages only. NaoNao currently delivers Hermes responses as complete messages.
 
 ## What it does
 
