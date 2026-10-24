@@ -1110,15 +1110,26 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
-    """Hermes must not preview-edit a create-only NaoNao channel."""
+    """NaoNao supports progressive edit; Hermes may wire stream deltas."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Platform("naonao") requires registry membership via plugin register().
+        register(_Ctx())
 
     def _adapter(self):
         posts = []
+        patches = []
 
         def handler(method, url, headers, body):
-            if str(url).endswith("/messages"):
+            url_s = str(url)
+            if method.upper() == "POST" and url_s.rstrip("/").endswith("/messages"):
                 posts.append(body)
-                return _Response(201, {"ok": True, "message": {"id": f"msg_{len(posts)}"}})
+                return _Response(201, {"ok": True, "message": {"id": "msg_stream_1"}})
+            if method.upper() == "PATCH" and "/messages/" in url_s:
+                patches.append({"url": url_s, "body": body})
+                mid = url_s.rstrip("/").rsplit("/", 1)[-1]
+                return _Response(200, {"ok": True, "message": {"id": mid, "content": (body or {}).get("content")}})
             return _Response(200, {})
 
         http = _Http(handler)
@@ -1128,6 +1139,8 @@ class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         adapter._http = http
         adapter._posts = posts
+        adapter._patches = patches
+        adapter._http_calls = http.calls
         return adapter
 
     def _decide(self, adapter, *, interim):
@@ -1169,49 +1182,188 @@ class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
         host = SimpleNamespace(_ctx=ctx, _runner=runner)
         return TurnRunner._setup_stream_consumer(host, "naonao")
 
-    def test_editing_capability_is_false(self):
-        self.assertIs(NaoNaoAdapter.SUPPORTS_MESSAGE_EDITING, False)
-
-    def test_global_streaming_does_not_wire_preview_deltas(self):
+    def test_editing_capability_is_true(self):
+        self.assertIs(NaoNaoAdapter.SUPPORTS_MESSAGE_EDITING, True)
         adapter = self._adapter()
-        for interim in (False, True):
-            consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=interim)
-            self.assertIsNone(delta_cb)
-            if consumer is not None:
-                self.assertFalse(consumer.stream_deltas_enabled)
-                self.assertEqual(consumer.cfg.cursor, "")
+        self.assertFalse(adapter.prefers_fresh_final_streaming("x"))
 
-    async def test_one_trigger_sends_one_final_message(self):
+    def test_global_streaming_wires_preview_deltas(self):
         adapter = self._adapter()
         consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=False)
-        self.assertIsNone(consumer)
-        self.assertIsNone(delta_cb)
-        final = "测试成功"
-        result = await adapter.send(
-            "community_a:channel_x", final, metadata={"naonao_event_id": "evt_stream"},
-        )
-        self.assertTrue(result.success)
-        self.assertEqual(adapter._posts, [{"content": final}])
-        self.assertNotIn("▉", final)
-        self.assertNotIn("▌", final)
+        self.assertIsNotNone(delta_cb)
+        self.assertIsNotNone(consumer)
+        self.assertTrue(consumer.stream_deltas_enabled)
+        self.assertTrue(bool(consumer.cfg.cursor))
 
-    async def test_deltas_do_not_create_messages_before_the_final(self):
+    async def test_send_then_edit_lifecycle_same_message_id(self):
         adapter = self._adapter()
-        _consumer, delta_cb, _interim_cb, _want_interim = self._decide(adapter, interim=False)
-        pieces = ["我国古代文学中最", "早的诗集是诗经。", "后面是完整的长回复。"]
-        if delta_cb is not None:
-            for piece in pieces:
-                delta_cb(piece)
-            await asyncio.sleep(0)
-        final = "".join(pieces)
-        result = await adapter.send(
-            "community_a:channel_x", final, metadata={"naonao_event_id": "evt_long"},
-        )
-        self.assertTrue(result.success)
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "中", metadata={"naonao_event_id": "evt_s"})
+        self.assertTrue(created.success)
+        self.assertEqual(created.message_id, "msg_stream_1")
         self.assertEqual(len(adapter._posts), 1)
-        self.assertEqual(adapter._posts[0]["content"], final)
-        self.assertNotIn("▉", adapter._posts[0]["content"])
-        self.assertNotIn("▌", adapter._posts[0]["content"])
+
+        e1 = await adapter.edit_message(chat, created.message_id, "中国 ▉")
+        e2 = await adapter.edit_message(chat, created.message_id, "中国古代 ▉")
+        e3 = await adapter.edit_message(
+            chat, created.message_id, "中国古代四大名著。", finalize=True,
+        )
+        self.assertTrue(e1.success)
+        self.assertTrue(e2.success)
+        self.assertTrue(e3.success)
+        self.assertEqual(e3.message_id, "msg_stream_1")
+        self.assertEqual(len(adapter._posts), 1)
+        self.assertGreaterEqual(len(adapter._patches), 1)
+        for p in adapter._patches:
+            self.assertIn("/channels/channel_x/messages/msg_stream_1", p["url"])
+            self.assertIn("content", p["body"])
+        self.assertEqual(adapter._patches[-1]["body"]["content"], "中国古代四大名著。")
+        self.assertNotIn("▉", adapter._patches[-1]["body"]["content"])
+
+    async def test_edit_body_is_full_accumulated_not_delta(self):
+        adapter = self._adapter()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "A")
+        await adapter.edit_message(chat, created.message_id, "AB")
+        await adapter.edit_message(chat, created.message_id, "ABC", finalize=True)
+        self.assertEqual(adapter._patches[-1]["body"]["content"], "ABC")
+        self.assertNotEqual(adapter._patches[-1]["body"]["content"], "C")
+
+    async def test_rapid_edits_coalesce_to_latest(self):
+        adapter = self._adapter()
+        # Slow PATCH so concurrent edits pile up while one is in flight.
+        release = asyncio.Event()
+        started = asyncio.Event()
+        posts = []
+        patches = []
+
+        async def slow_request(method, url, headers=None, json=None, follow_redirects=None):
+            adapter._http_calls.append({"method": method, "url": url, "json": json})
+            if method.upper() == "POST":
+                posts.append(json)
+                return _Response(201, {"ok": True, "message": {"id": "msg_c"}})
+            if method.upper() == "PATCH":
+                started.set()
+                await release.wait()
+                patches.append(json)
+                return _Response(200, {"ok": True, "message": {"id": "msg_c", "content": (json or {}).get("content")}})
+            return _Response(200, {})
+
+        adapter._http.request = slow_request
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "A")
+        self.assertEqual(created.message_id, "msg_c")
+        t1 = asyncio.create_task(adapter.edit_message(chat, created.message_id, "A"))
+        await started.wait()
+        t2 = asyncio.create_task(adapter.edit_message(chat, created.message_id, "AB"))
+        t3 = asyncio.create_task(adapter.edit_message(chat, created.message_id, "ABCD", finalize=True))
+        await asyncio.sleep(0.05)
+        release.set()
+        results = await asyncio.gather(t1, t2, t3)
+        self.assertTrue(all(r.success for r in results))
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(patches[-1]["content"], "ABCD")
+        self.assertLess(len(patches), 4)
+
+    async def test_403_does_not_post_replacement(self):
+        adapter = self._adapter()
+
+        def handler(method, url, headers, body):
+            if method.upper() == "POST":
+                return _Response(201, {"ok": True, "message": {"id": "msg_x"}})
+            return _Response(403, {"ok": False, "err": "insufficient_permissions"})
+
+        adapter._http.handler = handler
+        adapter._http.calls.clear()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "hi")
+        result = await adapter.edit_message(chat, created.message_id, "nope", finalize=True)
+        self.assertTrue(result.success)
+        self.assertTrue(result.raw_response.get("skipped"))
+        self.assertTrue(result.raw_response.get("naonao_edit_dead"))
+        post_count = sum(1 for c in adapter._http.calls if c["method"].upper() == "POST")
+        self.assertEqual(post_count, 1)
+
+    async def test_404_does_not_post_replacement(self):
+        adapter = self._adapter()
+
+        def handler(method, url, headers, body):
+            if method.upper() == "POST":
+                return _Response(201, {"ok": True, "message": {"id": "msg_y"}})
+            return _Response(404, {"ok": False, "err": "resource_not_found"})
+
+        adapter._http.handler = handler
+        adapter._http.calls.clear()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "hi")
+        result = await adapter.edit_message(chat, created.message_id, "gone", finalize=True)
+        self.assertTrue(result.success)
+        self.assertTrue(result.raw_response.get("naonao_edit_dead"))
+        post_count = sum(1 for c in adapter._http.calls if c["method"].upper() == "POST")
+        self.assertEqual(post_count, 1)
+
+    async def test_transient_retry_same_message_id_no_extra_post(self):
+        adapter = self._adapter()
+        attempts = {"n": 0}
+
+        def handler(method, url, headers, body):
+            if method.upper() == "POST":
+                return _Response(201, {"ok": True, "message": {"id": "msg_r"}})
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                return _Response(503, {"ok": False, "err": "internal_error"})
+            return _Response(200, {"ok": True, "message": {"id": "msg_r", "content": body.get("content")}})
+
+        adapter._http.handler = handler
+        adapter._http.calls.clear()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "hi")
+        result = await adapter.edit_message(chat, created.message_id, "ok", finalize=True)
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "msg_r")
+        self.assertGreaterEqual(attempts["n"], 2)
+        post_count = sum(1 for c in adapter._http.calls if c["method"].upper() == "POST")
+        self.assertEqual(post_count, 1)
+
+    async def test_markdown_code_unicode_preserved(self):
+        adapter = self._adapter()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, ".")
+        body = "你好 **粗体**\n```js\nconsole.log(1)\n```\n🎉"
+        result = await adapter.edit_message(chat, created.message_id, body, finalize=True)
+        self.assertTrue(result.success)
+        self.assertEqual(adapter._patches[-1]["body"]["content"], body)
+
+    async def test_gateway_event_filter_ignores_non_mention(self):
+        adapter = self._adapter()
+        frames = []
+
+        class Sock:
+            async def send(self, raw):
+                frames.append(json.loads(raw))
+
+        await adapter._on_event(Sock(), {
+            "t": "message.created",
+            "s": 9,
+            "d": {"id": "evt_noise", "message": {"id": "m1", "content": "hi"}},
+        })
+        self.assertTrue(any(f.get("op") == "ACK" for f in frames))
+        self.assertEqual(adapter._posts, [])
+
+    async def test_duplicate_regression_one_create_many_edits(self):
+        adapter = self._adapter()
+        chat = "community_a:channel_x"
+        created = await adapter.send(chat, "中国 ▉")
+        for text in ("中国古代 ▉", "中国古代四大名著 ▉", "中国古代四大名著包括《三国演义》。"):
+            await adapter.edit_message(
+                chat, created.message_id, text,
+                finalize=text.endswith("。"),
+            )
+        self.assertEqual(len(adapter._posts), 1)
+        self.assertEqual(created.message_id, "msg_stream_1")
+        self.assertEqual(adapter._patches[-1]["body"]["content"], "中国古代四大名著包括《三国演义》。")
+        patch_ids = {p["url"].rsplit("/", 1)[-1] for p in adapter._patches}
+        self.assertEqual(patch_ids, {"msg_stream_1"})
 
 
 if __name__ == "__main__":

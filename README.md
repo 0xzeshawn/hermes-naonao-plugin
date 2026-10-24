@@ -2,15 +2,18 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
+**Plugin version: 1.1.0**
+
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. NaoNao currently delivers Hermes responses as complete messages.
+Text messages only. When Message Edit is available on the NaoNao Public Bot API, Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes.
 
 ## What it does
 
 - Receives `message.bot_mention` and `command.invoked` on the Public Bot API v1 Gateway.
-- Sends text replies with the Bot API.
-- Supports ACK, resume, event dedupe, and outbound `Idempotency-Key`.
+- Sends text replies with `POST /api/v1/channels/:channelId/messages`.
+- Streams replies with `PATCH /api/v1/channels/:channelId/messages/:messageId` on the same message id (`SUPPORTS_MESSAGE_EDITING = True`).
+- Supports ACK, resume, event dedupe, and outbound `Idempotency-Key` on create.
 - Optional Home Channel for `hermes send`, cron, and other proactive delivery.
 
 ## Requirements
@@ -18,6 +21,7 @@ Text messages only. NaoNao currently delivers Hermes responses as complete messa
 - A NaoNao account
 - Hermes Agent, with the `hermes` command on your PATH
 - This plugin installed into your Hermes home
+- Hermes **streaming enabled** for same-message progressive updates (see below)
 
 A production bot needs one value:
 
@@ -74,6 +78,48 @@ platforms:
     enabled: true
 ```
 
+## Upgrade from v1.0.1
+
+v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit.
+
+Update the installed plugin, then restart the gateway:
+
+```bash
+hermes plugins update naonao
+hermes gateway restart
+```
+
+If `hermes plugins update naonao` is unavailable for your install, reinstall from the public repository:
+
+```bash
+hermes plugins remove naonao
+hermes plugins install https://github.com/0xzeshawn/hermes-naonao-plugin.git
+hermes plugins enable naonao
+hermes gateway restart
+```
+
+Symlink installs (`platforms/naonao`) must pull or replace the linked directory yourself, then `hermes gateway restart`.
+
+## Enable Hermes streaming
+
+Hermes keeps platform streaming **off by default**. Same-message NaoNao streaming requires the master switch:
+
+```bash
+hermes config set streaming.enabled true
+hermes gateway restart
+```
+
+Equivalent YAML in `~/.hermes/config.yaml`:
+
+```yaml
+streaming:
+  enabled: true
+```
+
+The default transport (`auto`) is enough for NaoNao: this adapter uses progressive `edit_message` (PATCH). You do not need to set `transport: edit` unless you are debugging other platforms.
+
+Without `streaming.enabled: true`, Hermes waits for the full reply and posts once — even with plugin v1.1.0.
+
 ## Configure
 
 Save the token with the Hermes CLI. It writes `~/.hermes/.env`. Do not put the token in `config.yaml`, a shell history you share, a URL, or a screenshot.
@@ -91,9 +137,41 @@ hermes gateway start
 hermes gateway status
 ```
 
+## Verify install (no Bot Token)
+
+```bash
+# Plugin version from the installed tree
+python3 - <<'PY'
+from pathlib import Path
+import re
+cands = [
+    Path.home() / ".hermes/plugins/naonao",
+    Path.home() / ".hermes/plugins/platforms/naonao",
+]
+for root in cands:
+    py = root / "plugin.yaml"
+    ad = root / "adapter.py"
+    if not py.exists() and not ad.exists():
+        continue
+    ver = re.search(r"(?m)^version:\s*([^\s#]+)", py.read_text()) if py.exists() else None
+    text = ad.read_text() if ad.exists() else ""
+    m = re.search(r"SUPPORTS_MESSAGE_EDITING\s*=\s*(\w+)", text)
+    print("path=", root.resolve() if root.exists() else root)
+    print("version=", ver.group(1) if ver else "MISSING")
+    print("SUPPORTS_MESSAGE_EDITING=", m.group(1) if m else "MISSING")
+    print("edit_message=", "def edit_message" in text)
+PY
+
+hermes config get streaming.enabled
+```
+
+Expect: `version=1.1.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+
 ## Test with @Bot
 
 In an allowed NaoNao text channel, type `@`, choose the bot from the menu, and send a message. You should get one text reply.
+
+With streaming enabled, a longer answer should appear as one message that grows in place (PATCH), not as a second final message.
 
 The first reply can include a Hermes note that no home channel is set. That note is normal. Chat still works.
 
@@ -162,6 +240,7 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | Application commands, including `/sethome` once you create it | Supported |
 | Home channel | Supported |
 | Proactive `hermes send` and cron | Supported |
+| Same-message streaming (requires `streaming.enabled: true`) | Supported (v1.1.0+) |
 | Images, files, voice, video | Not currently supported |
 | Ordinary channel messages that do not @ the bot | Not delivered |
 
@@ -177,6 +256,7 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | `NaoNao Bot is not currently assigned to an external connector` | In the Bot's 运行方式, choose 启用外部机器人. An AI Agent bot will not connect. |
 | The bot never replies, and the gateway log shows the user is unauthorized | Set `NAONAO_ALLOWED_USERS` or `NAONAO_ALLOW_ALL_USERS` as above. |
 | Sending fails with a permissions error | Confirm the app is installed in that community and has 查看频道 and 发送消息 on that channel. |
+| Reply appears all at once (no in-place growth) | Confirm plugin `version: 1.1.0`, `SUPPORTS_MESSAGE_EDITING=True`, and `streaming.enabled=true`, then `hermes gateway restart`. |
 | `/sethome` does not appear in the menu | Create the `sethome` command on this application. It is not built in. |
 | `hermes` says it cannot write `~/.local/bin` | That is the Hermes CLI symlink, not this plugin. Use a `hermes` binary you can already run, or fix the Hermes install permissions. |
 
@@ -190,20 +270,31 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | `NAONAO_ALLOW_ALL_USERS` | no | false | yes, for a community bot |
 | `NAONAO_HOME_CHANNEL` | no | unset | no; `/sethome` writes it |
 
-Recommended path: `hermes config set` for every value you do set. Alternative: edit `~/.hermes/.env` directly. Do not commit either file.
+Hermes streaming (config.yaml, not env):
+
+| Key | Required for streaming | Default |
+|---|---|---|
+| `streaming.enabled` | yes | `false` |
+
+Recommended path: `hermes config set` for every value you do set. Alternative: edit `~/.hermes/.env` / `config.yaml` directly. Do not commit either file.
 
 ## Integration contract
 
 The adapter uses Public Bot API v1. Production origin is `https://naonaoai.com`. Auth header is `Authorization: Bot <token>`.
 
 ```text
-GET  /api/v1/bot/me
-POST /api/v1/bot/gateway-session
-WSS  /gateway/v1
-POST /api/v1/channels/:channelId/messages
+GET   /api/v1/bot/me
+POST  /api/v1/bot/gateway-session
+WSS   /gateway/v1
+POST  /api/v1/channels/:channelId/messages
+PATCH /api/v1/channels/:channelId/messages/:messageId
 ```
 
 NaoNao owns the Bot Token, REST API, Gateway, installation, permissions, and the `message.bot_mention` and `command.invoked` events. Hermes owns agent execution, authorization, Home Channel, `/sethome`, `/whoami`, cron, and cross-platform delivery. The adapter translates between them.
+
+## Maintainer note (drift)
+
+This GitHub repository is what Hermes users install. If you also maintain a copy under an application monorepo, sync Hermes adapter changes here and bump `plugin.yaml` before release. Do not ship a capability flag mismatch (for example `SUPPORTS_MESSAGE_EDITING` True in one tree and False in the other).
 
 ## Documentation
 

@@ -8,6 +8,7 @@ Uses NaoNao Public Bot API v1 only:
     message.bot_mention
     command.invoked
     POST /api/v1/channels/:channelId/messages
+    PATCH /api/v1/channels/:channelId/messages/:messageId
 
 Hermes Gateway runs the agent. This module does not call Hermes /v1/runs.
 """
@@ -20,6 +21,7 @@ import json
 import logging
 import random
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
@@ -39,6 +41,10 @@ MAX_MESSAGE_LENGTH = 4000
 BACKOFF_SECONDS = (1, 2, 5, 10, 30)
 DEDUP_MAX = 1000
 SESSION_SKEW_SECONDS = 15
+# Adapter-level coalesce for denser Hermes edit ticks; pairs with ~180/min API edit limit.
+EDIT_THROTTLE_SECONDS = 0.35
+EDIT_MAX_ATTEMPTS = 3
+EDIT_RETRY_AFTER_CAP_SECONDS = 10.0
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 _COMMAND_NAME = re.compile(r"^[a-z0-9_-]{1,32}$")
 _NOT_ASSIGNED = (
@@ -98,9 +104,11 @@ class NaoNaoAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True
     supports_code_blocks = False
-    # Create-only platform. Hermes otherwise treats a missing flag as editable and
-    # posts a cursor preview, then a second final message when edit_message fails.
-    SUPPORTS_MESSAGE_EDITING = False
+    # Progressive edit via PATCH same messageId. Must stay True only while
+    # edit_message() is implemented — Hermes falls back to a second send() on edit failure.
+    SUPPORTS_MESSAGE_EDITING = True
+    # Never replace a streamed preview with a fresh final POST (duplicate risk).
+    FALLBACK_ON_FINAL_EDIT_FLOOD = False
 
     def __init__(self, config: PlatformConfig, *, http_factory=None, ws_connect=None):
         super().__init__(config=config, platform=Platform("naonao"))
@@ -130,6 +138,8 @@ class NaoNaoAdapter(BasePlatformAdapter):
         self._send_key: Dict[str, Dict[str, Any]] = {}
         self._shutdown = False
         self._attempt = 0
+        # Per messageId: single in-flight PATCH + pending coalesce.
+        self._edit_lanes: Dict[str, Dict[str, Any]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._shutdown:
@@ -198,6 +208,276 @@ class NaoNaoAdapter(BasePlatformAdapter):
                 "[naonao] outbound send failed chat_id=%s status=%s error=%s",
                 chat_id, getattr(result, "_http_status", "") or "-", redact(result.error),
             )
+        return result
+
+    def prefers_fresh_final_streaming(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Always edit in place — a fresh final POST would duplicate the preview."""
+        del content, metadata
+        return False
+
+    def _edit_lane(self, message_id: str) -> Dict[str, Any]:
+        mid = str(message_id or "")
+        lane = self._edit_lanes.get(mid)
+        if lane is None:
+            lane = {
+                "lock": asyncio.Lock(),
+                "last_flush_at": 0.0,
+                "dead": False,
+                "pending": None,
+                "pending_finalize": False,
+                "flushing": False,
+                "flush_done": asyncio.Event(),
+                "channel_id": "",
+                "last_result": None,
+            }
+            lane["flush_done"].set()
+            self._edit_lanes[mid] = lane
+        return lane
+
+    @staticmethod
+    def _skipped_edit(message_id: str, **extra: Any) -> SendResult:
+        """Tell Hermes the edit was deferred/terminal without triggering fallback send()."""
+        payload = {"skipped": True, **extra}
+        return SendResult(success=True, message_id=str(message_id or "") or None, raw_response=payload)
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+    ) -> SendResult:
+        """PATCH full accumulated content onto an existing Bot message.
+
+        Hermes stream consumer passes the full buffer (cursor-suffixed until finalize).
+        Never POST a replacement message from this path.
+        """
+        try:
+            _community, channel_id = split_chat_id(chat_id)
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc), error_kind="not_found")
+        mid = str(message_id or "").strip()
+        if not mid or mid == "__no_edit__":
+            return SendResult(success=False, error="invalid_message_id", error_kind="not_found")
+        text = str(content or "")
+        if len(text) > MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error="message_too_long", error_kind="too_long")
+        if self.has_fatal_error:
+            return SendResult(success=False, error="invalid_bot_token", error_kind="forbidden")
+
+        lane = self._edit_lane(mid)
+        become_flusher = False
+        async with lane["lock"]:
+            lane["channel_id"] = channel_id
+            if lane["dead"]:
+                logger.warning(
+                    "[naonao] edit aborted; message is dead message_id=%s finalize=%s",
+                    mid, finalize,
+                )
+                return self._skipped_edit(mid, naonao_edit_dead=True)
+
+            # Newest full accumulated content wins; intermediate versions are dropped.
+            lane["pending"] = text
+            if finalize:
+                lane["pending_finalize"] = True
+
+            if lane["flushing"]:
+                if finalize:
+                    # Wait outside the lock for the active flusher, then become flusher.
+                    done_event = lane["flush_done"]
+                else:
+                    return self._skipped_edit(mid, naonao_edit_coalesced=True)
+            else:
+                lane["flushing"] = True
+                lane["flush_done"].clear()
+                become_flusher = True
+                done_event = None
+
+        if not become_flusher:
+            await done_event.wait()
+            async with lane["lock"]:
+                if lane["dead"]:
+                    return self._skipped_edit(mid, naonao_edit_dead=True)
+                if lane["flushing"]:
+                    return lane["last_result"] or self._skipped_edit(mid, naonao_edit_coalesced=True)
+                if lane["pending"] is None and not lane["pending_finalize"]:
+                    return lane["last_result"] or self._skipped_edit(mid, naonao_edit_coalesced=True)
+                lane["flushing"] = True
+                lane["flush_done"].clear()
+                become_flusher = True
+
+        try:
+            result = await self._flush_edit_lane(mid, force_immediate=finalize)
+            async with lane["lock"]:
+                lane["last_result"] = result
+            return result
+        finally:
+            async with lane["lock"]:
+                lane["flushing"] = False
+                lane["flush_done"].set()
+
+    async def _flush_edit_lane(self, message_id: str, *, force_immediate: bool) -> SendResult:
+        lane = self._edit_lane(message_id)
+        last_result: Optional[SendResult] = None
+        while True:
+            async with lane["lock"]:
+                if lane["dead"]:
+                    return self._skipped_edit(message_id, naonao_edit_dead=True)
+                channel_id = str(lane.get("channel_id") or "")
+                latest = lane["pending"]
+                do_finalize = bool(lane["pending_finalize"])
+                if latest is None:
+                    return last_result or self._skipped_edit(message_id, naonao_edit_empty=True)
+                lane["pending"] = None
+                lane["pending_finalize"] = False
+                last_flush_at = float(lane["last_flush_at"] or 0.0)
+
+            if not force_immediate and not do_finalize and last_flush_at:
+                wait = EDIT_THROTTLE_SECONDS - (time.monotonic() - last_flush_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    async with lane["lock"]:
+                        if lane["pending"] is not None:
+                            continue
+                        if lane["pending_finalize"]:
+                            do_finalize = True
+
+            result = await self._patch_message_with_retries(
+                channel_id, message_id, str(latest), finalize=do_finalize or force_immediate
+            )
+            last_result = result
+            async with lane["lock"]:
+                raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                if raw.get("naonao_edit_dead"):
+                    lane["dead"] = True
+                    return result
+                if result.success and not raw.get("naonao_edit_gave_up"):
+                    lane["last_flush_at"] = time.monotonic()
+                if lane["pending"] is not None or lane["pending_finalize"]:
+                    force_immediate = bool(lane["pending_finalize"] or force_immediate)
+                    continue
+                return result
+
+    async def _patch_message_with_retries(
+        self, channel_id: str, message_id: str, content: str, *, finalize: bool
+    ) -> SendResult:
+        last: Optional[SendResult] = None
+        for attempt in range(1, EDIT_MAX_ATTEMPTS + 1):
+            last = await self._patch_message(channel_id, message_id, content)
+            if last.success:
+                return last
+            kind = getattr(last, "error_kind", None) or "unknown"
+            status = getattr(last, "_http_status", None)
+            if kind in ("forbidden", "not_found") or status in (403, 404):
+                logger.error(
+                    "[naonao] edit permanently failed message_id=%s status=%s error=%s — keeping partial, no POST",
+                    message_id, status or "-", redact(last.error),
+                )
+                return self._skipped_edit(message_id, naonao_edit_dead=True, finalize=finalize)
+            if not getattr(last, "retryable", False):
+                break
+            if attempt >= EDIT_MAX_ATTEMPTS:
+                break
+            delay = float(getattr(last, "retry_after", None) or 0.25 * attempt)
+            delay = max(0.05, min(delay, EDIT_RETRY_AFTER_CAP_SECONDS))
+            logger.info(
+                "[naonao] edit retry message_id=%s attempt=%s/%s after=%.2fs",
+                message_id, attempt, EDIT_MAX_ATTEMPTS, delay,
+            )
+            await asyncio.sleep(delay)
+            # Prefer newest coalesced content if another edit arrived while we slept —
+            # under the lane lock this is still `content`, but keep the parameter for clarity.
+
+        # Exhausted / non-retryable: never let Hermes fallback-send a second bubble.
+        logger.error(
+            "[naonao] edit gave up message_id=%s finalize=%s error=%s — keeping partial, no POST",
+            message_id, finalize, redact(last.error if last else ""),
+        )
+        return self._skipped_edit(
+            message_id,
+            naonao_edit_gave_up=True,
+            finalize=finalize,
+            last_error=redact(last.error if last else ""),
+        )
+
+    async def _patch_message(self, channel_id: str, message_id: str, content: str) -> SendResult:
+        if self._http is None:
+            result = SendResult(success=False, error="http_unavailable", error_kind="transient", retryable=True)
+            result._http_status = "-"
+            return result
+        try:
+            response = await self._http.request(
+                "PATCH",
+                f"{self._api_base}/api/v1/channels/{channel_id}/messages/{message_id}",
+                headers={
+                    "Authorization": f"Bot {self._bot_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"content": content},
+                follow_redirects=False,
+            )
+        except _FatalAuth:
+            return SendResult(success=False, error="invalid_bot_token", error_kind="forbidden")
+        except Exception as exc:
+            result = SendResult(success=False, error=redact(exc), error_kind="transient", retryable=True)
+            result._http_status = "-"
+            return result
+
+        body = _json_or_empty(response)
+        if response.status_code == 200:
+            message = body.get("message") if isinstance(body, dict) else {}
+            mid = str((message or {}).get("id") or message_id) or message_id
+            result = SendResult(success=True, message_id=mid, raw_response=body)
+            result._http_status = response.status_code
+            return result
+        if response.status_code == 401:
+            await self._fatal_auth()
+            result = SendResult(success=False, error="invalid_bot_token", error_kind="forbidden")
+            result._http_status = response.status_code
+            return result
+        if response.status_code == 403:
+            result = SendResult(
+                success=False,
+                error=str(body.get("err") or "insufficient_permissions"),
+                error_kind="forbidden",
+            )
+            result._http_status = response.status_code
+            return result
+        if response.status_code == 404:
+            result = SendResult(
+                success=False,
+                error=str(body.get("err") or "resource_not_found"),
+                error_kind="not_found",
+            )
+            result._http_status = response.status_code
+            return result
+        if response.status_code == 429:
+            result = SendResult(
+                success=False,
+                error="rate_limited",
+                error_kind="rate_limited",
+                retryable=True,
+                retry_after=float(body.get("retryAfterSec") or 1),
+            )
+            result._http_status = response.status_code
+            return result
+        if response.status_code == 400 and str(body.get("err") or "") == "message_too_long":
+            result = SendResult(success=False, error="message_too_long", error_kind="too_long")
+            result._http_status = response.status_code
+            return result
+        if response.status_code >= 500:
+            result = SendResult(
+                success=False,
+                error=str(body.get("err") or "internal_error"),
+                error_kind="transient",
+                retryable=True,
+            )
+            result._http_status = response.status_code
+            return result
+        result = SendResult(
+            success=False,
+            error=str(body.get("err") or response.status_code),
+            error_kind="unknown",
+        )
+        result._http_status = response.status_code
         return result
 
     def _claim_idempotency_key(self, event_id: str) -> str:
