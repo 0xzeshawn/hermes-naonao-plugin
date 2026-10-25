@@ -6,7 +6,7 @@ NaoNao is a community and channel-based communication platform. This adapter con
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. When Message Edit is available on the NaoNao Public Bot API, Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. v1.2.0 adds channel typing indicators and a temporary 👀 ACK. v1.3.0 adds safe agent/tool activity states (no chain-of-thought, no raw tool args). v1.3.1 keeps Hermes tool-progress phrases out of chat Messages (Activity only) and removes 👀 after the final answer.
+Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.1**.
 
 ## What it does
 
@@ -15,9 +15,66 @@ Text messages only. When Message Edit is available on the NaoNao Public Bot API,
 - Streams replies with `PATCH /api/v1/channels/:channelId/messages/:messageId` on the same message id (`SUPPORTS_MESSAGE_EDITING = True`).
 - Shows Typing via `POST /api/v1/channels/:channelId/typing` until the first streamed reply appears.
 - Acknowledges the triggering user message with temporary 👀 (`PUT` on start, `DELETE` after final / abort).
-- Shows safe Tool Activity via `POST /api/v1/channels/:channelId/activity` (`supports_status_text` / Hermes live status). Hermes tool-progress chat bubbles are disabled for NaoNao so phrases like `🔍 Searching the web…` never become Messages.
+- Shows safe Tool Activity via `POST /api/v1/channels/:channelId/activity` (Hermes live status / `supports_status_text`). NaoNao defaults Hermes `tool_progress` to off so progress phrases stay out of the Message timeline.
 - Supports ACK, resume, event dedupe, and outbound `Idempotency-Key` on create.
 - Optional Home Channel for `hermes send`, cron, and other proactive delivery.
+
+## Turn lifecycle
+
+```text
+User mentions Hermes
+        ↓
+Temporary 👀 acknowledgement
+        ↓
+Typing indicator
+        ↓
+Real tool call? ── No ──→ First response POST
+        │
+       Yes
+        ↓
+Safe Tool Activity (ephemeral)
+        ↓
+Tool completes / Activity clears
+        ↓
+First response POST
+        ↓
+Same-message PATCH streaming
+        ↓
+Final PATCH
+        ↓
+Streaming cursor removed (Hermes UX)
+        ↓
+Temporary 👀 removed
+```
+
+Intermediate streamed text may include a Hermes cursor character (`▉`). That cursor is Hermes Streaming UX, not a NaoNao API field. After the final PATCH it disappears.
+
+### Typing vs Tool Activity
+
+**Activity > Typing.** They should not appear together for the same Bot.
+
+| Path | Signals |
+|---|---|
+| No tool | 👀 → Typing → first POST → PATCH streaming → final → 👀 removed |
+| With tool | 👀 → Typing → Tool Activity → first POST → PATCH streaming → final → 👀 removed |
+
+Typing, Reaction, and Activity are best-effort UX signals. Failures there must not block the AI text reply. The Message create/edit path is the delivery path for the answer.
+
+### Persistent vs ephemeral
+
+| Capability | Persistent | Stored as Message | Typical lifetime |
+|---|---|---|---|
+| Bot Message | Yes | Yes | Permanent |
+| Message Edit | Yes | Updates same message | Permanent |
+| Reaction (👀 ACK) | Until removed | Message metadata | Temporary for Hermes ACK |
+| Typing | No | No | Server TTL ~10s |
+| Tool Activity | No | No | Server TTL ~12s |
+
+### Tool progress vs Activity
+
+NaoNao presents tool work through **live status → Activity** (safe category enum only).
+
+Hermes **tool_progress chat bubbles stay disabled** for the `naonao` platform (adapter display defaults: `tool_progress=off`, while `streaming` still follows global `streaming.enabled`). That keeps tool status out of ordinary Messages. Activity API never accepts free-form display text, tool arguments, URLs, paths, credentials, or reasoning.
 
 ## Requirements
 
@@ -63,15 +120,15 @@ hermes plugins enable naonao
 
 Hermes clones the repository to `~/.hermes/plugins/naonao`. The plugin id is `naonao`. The gateway platform key is also `naonao`.
 
-Local development, when you already have this directory and are not installing from GitHub, can symlink it under the platforms category instead:
+Local development, when you already have this directory (or a monorepo copy such as `/path/to/Aether-Link/integrations/hermes/naonao-platform`) and are not installing from GitHub, can symlink it under the platforms category instead:
 
 ```bash
 mkdir -p ~/.hermes/plugins/platforms
-ln -s /path/to/this/plugin ~/.hermes/plugins/platforms/naonao
+ln -s /path/to/Aether-Link/integrations/hermes/naonao-platform ~/.hermes/plugins/platforms/naonao
 hermes plugins enable platforms/naonao
 ```
 
-That path-derived id is `platforms/naonao`. It is not the id produced by `hermes plugins install`.
+That path-derived id is `platforms/naonao`. It is not the id produced by `hermes plugins install`. After changing the linked tree, run `hermes gateway restart` (reinstall is not required for a symlink).
 
 Add this to `~/.hermes/config.yaml` if it is not already there:
 
@@ -81,18 +138,27 @@ platforms:
     enabled: true
 ```
 
-## Upgrade from v1.2.x / v1.1.x / v1.0.1
+## Version highlights
 
-v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit. v1.1.1 recovers correctly when a streaming edit permanently fails (403/404) so Hermes can deliver the complete answer via fallback instead of leaving a stuck partial. v1.2.0 adds Typing + temporary 👀 ACK. v1.3.0 adds safe agent/tool activity states driven by Hermes live status (enum categories only; never forwards tool args, URLs, paths, or reasoning). v1.3.1 (Phase 3F) defaults NaoNao `tool_progress` off so Hermes progress phrases never POST as Messages, and deletes 👀 after final delivery.
+| Version | Highlights |
+|---|---|
+| v1.1.x | Same-message Streaming via Message Edit; edit-failure recovery |
+| v1.2.0 | Typing + temporary 👀 acknowledgement |
+| v1.3.0 | Safe Agent / Tool Activity categories |
+| v1.3.1 | Tool status via Activity only; 👀 removed after final delivery |
 
-Update the installed plugin, then restart the gateway:
+Recommended: **v1.3.1**.
+
+## Upgrade
+
+If your Hermes CLI supports plugin update:
 
 ```bash
 hermes plugins update naonao
 hermes gateway restart
 ```
 
-If `hermes plugins update naonao` is unavailable for your install, reinstall from the public repository:
+Otherwise reinstall from the public repository:
 
 ```bash
 hermes plugins remove naonao
@@ -168,13 +234,13 @@ PY
 hermes config get streaming.enabled
 ```
 
-Expect: `version=1.3.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+Expect: `version=1.3.1`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
 
 ## Test with @Bot
 
 In an allowed NaoNao text channel, type `@`, choose the bot from the menu, and send a message. You should get one text reply.
 
-With streaming enabled, a longer answer should appear as one message that grows in place (PATCH), not as a second final message.
+With streaming enabled, a longer answer should appear as one message that grows in place (PATCH), not as a second final message. You may briefly see 👀 on the user message and Typing under the composer; both clear after the turn. If Hermes runs a real tool (for example web search), you should see an ephemeral Activity line such as `正在搜索资料…`, not a separate Bot Message for tool status.
 
 The first reply can include a Hermes note that no home channel is set. That note is normal. Chat still works.
 
@@ -263,7 +329,10 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | `NaoNao Bot is not currently assigned to an external connector` | In the Bot's 运行方式, choose 启用外部机器人. An AI Agent bot will not connect. |
 | The bot never replies, and the gateway log shows the user is unauthorized | Set `NAONAO_ALLOWED_USERS` or `NAONAO_ALLOW_ALL_USERS` as above. |
 | Sending fails with a permissions error | Confirm the app is installed in that community and has 查看频道 and 发送消息 on that channel. |
-| Reply appears all at once (no in-place growth) | Confirm plugin `version: 1.1.0`, `SUPPORTS_MESSAGE_EDITING=True`, and `streaming.enabled=true`, then `hermes gateway restart`. |
+| Streaming arrives as one full message | Confirm plugin ≥ `1.1.0` (recommend `1.3.1`), `SUPPORTS_MESSAGE_EDITING=True`, `streaming.enabled=true`, then `hermes gateway restart`. Also confirm the model provider emits deltas. |
+| Tool status appears as a normal chat message | Upgrade to plugin ≥ **v1.3.1** and restart the gateway. Do not filter message text by emoji or phrase. |
+| Typing or Activity looks stuck | Server TTL clears them (~10s typing / ~12s activity). Check gateway connectivity; sending a Bot message also clears both for that Bot. |
+| No Tool Activity | Confirm Hermes actually invoked a tool. Ordinary generation does not invent Activity. |
 | `/sethome` does not appear in the menu | Create the `sethome` command on this application. It is not built in. |
 | `hermes` says it cannot write `~/.local/bin` | That is the Hermes CLI symlink, not this plugin. Use a `hermes` binary you can already run, or fix the Hermes install permissions. |
 
@@ -287,20 +356,23 @@ Recommended path: `hermes config set` for every value you do set. Alternative: e
 
 ## Integration contract
 
-The adapter uses Public Bot API v1. Production origin is `https://naonaoai.com`. Auth header is `Authorization: Bot <token>`.
+The adapter uses Public Bot API v1. Production origin is `https://naonaoai.com`. Auth header is `Authorization: Bot <token>` (not `Bearer`).
 
 ```text
-GET   /api/v1/bot/me
-POST  /api/v1/bot/gateway-session
-WSS   /gateway/v1
-POST  /api/v1/channels/:channelId/messages
-PATCH /api/v1/channels/:channelId/messages/:messageId
-POST  /api/v1/channels/:channelId/typing
-POST  /api/v1/channels/:channelId/activity
-PUT   /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
+GET    /api/v1/bot/me
+POST   /api/v1/bot/gateway-session
+WSS    /gateway/v1
+POST   /api/v1/channels/:channelId/messages
+PATCH  /api/v1/channels/:channelId/messages/:messageId
+POST   /api/v1/channels/:channelId/typing
+POST   /api/v1/channels/:channelId/activity
+PUT    /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
+DELETE /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
 ```
 
 NaoNao owns the Bot Token, REST API, Gateway, installation, permissions, and the `message.bot_mention` and `command.invoked` events. Hermes owns agent execution, authorization, Home Channel, `/sethome`, `/whoami`, cron, and cross-platform delivery. The adapter translates between them.
+
+Channel clients may also observe Socket.IO events such as `receive_message`, `message_updated`, `message_reaction_updated`, `typing_update`, and `bot_activity_update`. Typing and Activity events are ephemeral; they are not chat history.
 
 ## Maintainer note (drift)
 
@@ -311,9 +383,17 @@ This GitHub repository is what Hermes users install. If you also maintain a copy
 - [NaoNao Hermes guide](https://naonaoai.com/docs/hermes)
 - [Public Bot API v1](https://naonaoai.com/docs/public-bot-api)
 
-## Security
+## Security / Privacy
 
 The Bot Token is a secret. Do not commit it, put it in a URL, log it, share it publicly, or share a screenshot that contains it. The plaintext is shown once, at creation or rotation. If it is exposed, revoke it and set the new value with `hermes config set`.
+
+Authenticate Bot REST calls with:
+
+```http
+Authorization: Bot $NAONAO_BOT_TOKEN
+```
+
+NaoNao Activity is not a reasoning stream. Do not send chain-of-thought, raw tool arguments, raw tool output, credential-bearing URLs, or filesystem paths through Activity. Only allowlisted categories (`processing`, `search`, `browser`, `file`, `code`, `external`) are accepted; the UI maps them to fixed copy such as `正在搜索资料…`.
 
 ## License
 
