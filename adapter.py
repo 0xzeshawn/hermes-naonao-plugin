@@ -10,6 +10,7 @@ Uses NaoNao Public Bot API v1 only:
     POST /api/v1/channels/:channelId/messages
     PATCH /api/v1/channels/:channelId/messages/:messageId
     POST /api/v1/channels/:channelId/typing
+    POST /api/v1/channels/:channelId/activity
     PUT  /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
 
 Hermes Gateway runs the agent. This module does not call Hermes /v1/runs.
@@ -49,7 +50,55 @@ EDIT_MAX_ATTEMPTS = 3
 EDIT_RETRY_AFTER_CAP_SECONDS = 10.0
 # Phase 2: acknowledge the triggering user message (not tool-state reactions).
 ACK_REACTION_EMOJI = "👀"
+# Phase 3: Hermes tool name → NaoNao safe activity category (never raw names/args).
+ACTIVITY_CATEGORIES = frozenset({
+    "processing", "search", "browser", "file", "code", "external",
+})
+# Conservative mapping of Hermes built-in tool names. Unknown → processing.
+_TOOL_ACTIVITY_CATEGORY: Dict[str, str] = {
+    "web_search": "search",
+    "search_files": "search",
+    "session_search": "search",
+    "tool_search": "search",
+    "web_extract": "browser",
+    "browser_navigate": "browser",
+    "browser_click": "browser",
+    "browser_type": "browser",
+    "browser_scroll": "browser",
+    "browser_back": "browser",
+    "browser_press": "browser",
+    "browser_snapshot": "browser",
+    "browser_get_images": "browser",
+    "browser_vision": "browser",
+    "browser_exec": "browser",
+    "read_file": "file",
+    "write_file": "file",
+    "patch": "file",
+    "skill_view": "file",
+    "terminal": "code",
+    "execute_code": "code",
+    "tool_call": "external",
+    "tool_describe": "external",
+}
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
+
+
+def map_tool_to_activity_category(tool_name: str) -> str:
+    """Map a Hermes tool name to a Public Bot API activity category.
+
+    Never returns raw tool names. Unknown / empty → processing.
+    """
+    name = str(tool_name or "").strip()
+    if not name or name == "_thinking":
+        return "processing"
+    mapped = _TOOL_ACTIVITY_CATEGORY.get(name)
+    if mapped in ACTIVITY_CATEGORIES:
+        return mapped
+    # MCP / plugin tools often look like mcp__server__tool — treat as external.
+    lower = name.lower()
+    if lower.startswith("mcp") or "__" in name:
+        return "external"
+    return "processing"
 _COMMAND_NAME = re.compile(r"^[a-z0-9_-]{1,32}$")
 _NOT_ASSIGNED = (
     "NaoNao Bot is not currently assigned to an external connector. "
@@ -113,6 +162,8 @@ class NaoNaoAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = True
     # Never replace a streamed preview with a fresh final POST (duplicate risk).
     FALLBACK_ON_FINAL_EDIT_FLOOD = False
+    # Phase 3: Gateway _progress_live_status → set_status_text on tool.started/completed.
+    supports_status_text = True
 
     def __init__(self, config: PlatformConfig, *, http_factory=None, ws_connect=None):
         super().__init__(config=config, platform=Platform("naonao"))
@@ -144,6 +195,10 @@ class NaoNaoAdapter(BasePlatformAdapter):
         self._attempt = 0
         # Per messageId: single in-flight PATCH + pending coalesce.
         self._edit_lanes: Dict[str, Dict[str, Any]] = {}
+        # Phase 3: last safe activity category per chat; pending flush for sync→async bridge.
+        self._activity_category_by_chat: Dict[str, str] = {}
+        self._activity_flush_needed: Dict[str, Optional[str]] = {}  # chat_id → category|None(clear)
+        self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._shutdown:
@@ -171,6 +226,10 @@ class NaoNaoAdapter(BasePlatformAdapter):
             await self._close_http()
             return False
         self._shutdown = False
+        try:
+            self._asyncio_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._asyncio_loop = None
         self._loop_task = asyncio.create_task(self._connection_loop())
         self._mark_connected()
         logger.info("[naonao] gateway session ready bot=%s", self._bot_name or "bot")
@@ -207,8 +266,9 @@ class NaoNaoAdapter(BasePlatformAdapter):
                 "[naonao] outbound send success chat_id=%s message_id=%s",
                 chat_id, result.message_id or "",
             )
-            # First streamed POST clears Typing; server also clears on create.
+            # First streamed POST clears Typing + Activity; server also clears on create.
             await self._set_channel_typing(channel_id, False)
+            await self._set_channel_activity(channel_id, False)
         else:
             logger.info(
                 "[naonao] outbound send failed chat_id=%s status=%s error=%s",
@@ -217,8 +277,15 @@ class NaoNaoAdapter(BasePlatformAdapter):
         return result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Best-effort Typing ON (Hermes _keep_typing refreshes ~2s). Never raises."""
+        """Best-effort Typing ON (Hermes _keep_typing refreshes ~2s). Never raises.
+
+        Also flushes any pending Tool Activity posted from sync set_status_text.
+        Tool Activity > Typing: skip typing refresh while activity is active for this chat.
+        """
         del metadata
+        await self._flush_pending_activity(str(chat_id))
+        if self._activity_category_by_chat.get(str(chat_id)):
+            return
         try:
             _community, channel_id = split_chat_id(chat_id)
         except ValueError:
@@ -232,6 +299,93 @@ class NaoNaoAdapter(BasePlatformAdapter):
         except ValueError:
             return
         await self._set_channel_typing(channel_id, False)
+
+    def set_status_text(self, chat_id: str, text: Optional[str] = None) -> None:
+        """Hermes Gateway live-status hook (tool.started / tool.completed).
+
+        Gateway may pass a human phrase that includes previews (paths/URLs/queries).
+        We NEVER forward that phrase to NaoNao — only a safe enum category.
+        Sync-safe: queues a flush; HTTP runs on the adapter event loop / typing tick.
+        """
+        super().set_status_text(chat_id, text)
+        chat_key = str(chat_id or "")
+        if not chat_key:
+            return
+        try:
+            split_chat_id(chat_key)
+        except ValueError:
+            return
+
+        if not text:
+            self._activity_category_by_chat.pop(chat_key, None)
+            self._activity_flush_needed[chat_key] = None  # clear
+        else:
+            category = self._category_from_status_phrase(str(text))
+            self._activity_category_by_chat[chat_key] = category
+            self._activity_flush_needed[chat_key] = category
+        self._kick_activity_flush(chat_key)
+
+    def set_activity_for_tool(self, chat_id: str, tool_name: str) -> None:
+        """Explicit helper (tests): map tool name → activity without using phrase text."""
+        chat_key = str(chat_id or "")
+        try:
+            split_chat_id(chat_key)
+        except ValueError:
+            return
+        category = map_tool_to_activity_category(tool_name)
+        self._activity_category_by_chat[chat_key] = category
+        self._activity_flush_needed[chat_key] = category
+        self._kick_activity_flush(chat_key)
+
+    def clear_activity(self, chat_id: str) -> None:
+        """Explicit helper (tests): clear activity for a chat."""
+        self.set_status_text(chat_id, None)
+
+    @staticmethod
+    def _category_from_status_phrase(phrase: str) -> str:
+        """Derive safe category from Hermes status phrase without leaking phrase content."""
+        raw = str(phrase or "").strip()
+        if not raw:
+            return "processing"
+        try:
+            from agent.display import build_status_phrase
+        except Exception:
+            return "processing"
+        best = ("processing", 0)
+        for tool_name, category in _TOOL_ACTIVITY_CATEGORY.items():
+            try:
+                stem_phrase = build_status_phrase(tool_name, None)
+            except Exception:
+                continue
+            if not stem_phrase:
+                continue
+            stem = str(stem_phrase).rstrip("…").rstrip(".").strip()
+            if stem and raw.startswith(stem) and len(stem) > best[1]:
+                best = (category, len(stem))
+        return best[0] if best[0] in ACTIVITY_CATEGORIES else "processing"
+
+    def _kick_activity_flush(self, chat_id: str) -> None:
+        """Schedule async flush onto the gateway loop when available."""
+        loop = self._asyncio_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._flush_pending_activity(chat_id), loop)
+        except Exception:
+            logger.debug("[naonao] activity flush kick failed")
+
+    async def _flush_pending_activity(self, chat_id: str) -> None:
+        if chat_id not in self._activity_flush_needed:
+            return
+        category = self._activity_flush_needed.pop(chat_id)
+        try:
+            _community, channel_id = split_chat_id(chat_id)
+        except ValueError:
+            return
+        if category is None:
+            await self._set_channel_activity(channel_id, False)
+        else:
+            await self._set_channel_activity(channel_id, True, category=category)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add 👀 on the triggering user message. Best-effort; never blocks the turn."""
@@ -277,6 +431,43 @@ class NaoNaoAdapter(BasePlatformAdapter):
             return
         except Exception as exc:
             logger.debug("[naonao] typing request failed: %s", redact(exc))
+
+    async def _set_channel_activity(
+        self, channel_id: str, active: bool, *, category: Optional[str] = None
+    ) -> None:
+        """Best-effort Activity API. Never raises; never sends free-form text."""
+        if self._http is None or self.has_fatal_error or not channel_id:
+            return
+        body: Dict[str, Any] = {"active": bool(active)}
+        if active:
+            cat = str(category or "processing")
+            if cat not in ACTIVITY_CATEGORIES:
+                cat = "processing"
+            body["category"] = cat
+        try:
+            response = await self._http.request(
+                "POST",
+                f"{self._api_base}/api/v1/channels/{channel_id}/activity",
+                headers={
+                    "Authorization": f"Bot {self._bot_token}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                follow_redirects=False,
+            )
+            if response.status_code == 401:
+                await self._fatal_auth()
+                return
+            if response.status_code >= 400:
+                logger.debug(
+                    "[naonao] activity %s failed status=%s",
+                    "on" if active else "off",
+                    response.status_code,
+                )
+        except _FatalAuth:
+            return
+        except Exception as exc:
+            logger.debug("[naonao] activity request failed: %s", redact(exc))
 
     async def _put_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
         if self._http is None or self.has_fatal_error or not channel_id or not message_id:

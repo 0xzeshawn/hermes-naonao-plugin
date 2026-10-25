@@ -1,13 +1,13 @@
 name: naonao
 label: NaoNao
 kind: platform
-version: 1.2.0
+version: 1.3.0
 description: >
   NaoNao messaging platform adapter for Hermes Agent.
   Connects with a NaoNao Bot Token, receives message.bot_mention and
   command.invoked on the Public Bot API v1 Gateway, and sends text replies
   through the Bot API. Supports same-message streaming edits, channel typing
-  indicators, and message reactions (👀 ack).
+  indicators, message reactions (👀 ack), and safe agent/tool activity states.
   Hermes Gateway runs the agent. This plugin does not call the Hermes HTTP API.
 author: NaoNao
 license: MIT

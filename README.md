@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.2.0**
+**Plugin version: 1.3.0**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. When Message Edit is available on the NaoNao Public Bot API, Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. v1.2.0 adds channel typing indicators and a 👀 reaction on the triggering message.
+Text messages only. When Message Edit is available on the NaoNao Public Bot API, Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. v1.2.0 adds channel typing indicators and a 👀 reaction. v1.3.0 adds safe agent/tool activity states (no chain-of-thought, no raw tool args).
 
 ## What it does
 
@@ -15,6 +15,7 @@ Text messages only. When Message Edit is available on the NaoNao Public Bot API,
 - Streams replies with `PATCH /api/v1/channels/:channelId/messages/:messageId` on the same message id (`SUPPORTS_MESSAGE_EDITING = True`).
 - Shows Typing via `POST /api/v1/channels/:channelId/typing` until the first streamed reply appears.
 - Acknowledges the triggering user message with 👀 (`PUT .../reactions/:emoji`).
+- Shows safe Tool Activity via `POST /api/v1/channels/:channelId/activity` (`supports_status_text` / Hermes live status).
 - Supports ACK, resume, event dedupe, and outbound `Idempotency-Key` on create.
 - Optional Home Channel for `hermes send`, cron, and other proactive delivery.
 
@@ -80,9 +81,9 @@ platforms:
     enabled: true
 ```
 
-## Upgrade from v1.1.x / v1.0.1
+## Upgrade from v1.2.x / v1.1.x / v1.0.1
 
-v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit. v1.1.1 recovers correctly when a streaming edit permanently fails (403/404) so Hermes can deliver the complete answer via fallback instead of leaving a stuck partial. v1.2.0 adds Typing + 👀 reaction (best-effort UX; failures never block the AI reply).
+v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit. v1.1.1 recovers correctly when a streaming edit permanently fails (403/404) so Hermes can deliver the complete answer via fallback instead of leaving a stuck partial. v1.2.0 adds Typing + 👀 reaction. v1.3.0 adds safe agent/tool activity states driven by Hermes live status (enum categories only; never forwards tool args, URLs, paths, or reasoning).
 
 Update the installed plugin, then restart the gateway:
 
@@ -167,7 +168,7 @@ PY
 hermes config get streaming.enabled
 ```
 
-Expect: `version=1.2.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+Expect: `version=1.3.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
 
 ## Test with @Bot
 
@@ -245,6 +246,7 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | Same-message streaming (requires `streaming.enabled: true`) | Supported (v1.1.0+) |
 | Typing indicator before first reply | Supported (v1.2.0+) |
 | 👀 reaction on triggering message | Supported (v1.2.0+) |
+| Safe tool activity states | Supported (v1.3.0+) |
 | Images, files, voice, video | Not currently supported |
 | Ordinary channel messages that do not @ the bot | Not delivered |
 
@@ -293,6 +295,7 @@ WSS   /gateway/v1
 POST  /api/v1/channels/:channelId/messages
 PATCH /api/v1/channels/:channelId/messages/:messageId
 POST  /api/v1/channels/:channelId/typing
+POST  /api/v1/channels/:channelId/activity
 PUT   /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
 ```
 
