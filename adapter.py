@@ -12,6 +12,7 @@ Uses NaoNao Public Bot API v1 only:
     POST /api/v1/channels/:channelId/typing
     POST /api/v1/channels/:channelId/activity
     PUT  /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
+    DELETE /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
 
 Hermes Gateway runs the agent. This module does not call Hermes /v1/runs.
 """
@@ -48,7 +49,8 @@ SESSION_SKEW_SECONDS = 15
 EDIT_THROTTLE_SECONDS = 0.35
 EDIT_MAX_ATTEMPTS = 3
 EDIT_RETRY_AFTER_CAP_SECONDS = 10.0
-# Phase 2: acknowledge the triggering user message (not tool-state reactions).
+# Phase 2/3F: temporary processing ACK on the triggering user message.
+# Added on_processing_start; removed on_processing_complete (final/abort).
 ACK_REACTION_EMOJI = "👀"
 # Phase 3: Hermes tool name → NaoNao safe activity category (never raw names/args).
 ACTIVITY_CATEGORIES = frozenset({
@@ -343,25 +345,42 @@ class NaoNaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _category_from_status_phrase(phrase: str) -> str:
-        """Derive safe category from Hermes status phrase without leaking phrase content."""
+        """Derive safe category from Hermes status/progress phrase; never forward phrase.
+
+        Matches live-status stems (``build_status_phrase``) and curated tool verbs
+        (``get_tool_verb``) so both Slack-style ``is searching…`` and progress-style
+        ``🔍 Searching the web for …`` classify to the same safe enum. Classification
+        only — the raw phrase is discarded before any NaoNao API call.
+        """
         raw = str(phrase or "").strip()
         if not raw:
             return "processing"
+        raw_l = raw.lower()
         try:
-            from agent.display import build_status_phrase
+            from agent.display import build_status_phrase, get_tool_verb
         except Exception:
             return "processing"
         best = ("processing", 0)
         for tool_name, category in _TOOL_ACTIVITY_CATEGORY.items():
+            score = 0
             try:
                 stem_phrase = build_status_phrase(tool_name, None)
             except Exception:
-                continue
-            if not stem_phrase:
-                continue
-            stem = str(stem_phrase).rstrip("…").rstrip(".").strip()
-            if stem and raw.startswith(stem) and len(stem) > best[1]:
-                best = (category, len(stem))
+                stem_phrase = None
+            if stem_phrase:
+                stem = str(stem_phrase).rstrip("…").rstrip(".").strip()
+                if stem and (raw.startswith(stem) or stem.lower() in raw_l):
+                    score = max(score, len(stem))
+            try:
+                verb = get_tool_verb(tool_name)
+            except Exception:
+                verb = None
+            if verb:
+                verb_s = str(verb).strip()
+                if verb_s and verb_s.lower() in raw_l:
+                    score = max(score, len(verb_s))
+            if score > best[1]:
+                best = (category, score)
         return best[0] if best[0] in ACTIVITY_CATEGORIES else "processing"
 
     def _kick_activity_flush(self, chat_id: str) -> None:
@@ -400,9 +419,29 @@ class NaoNaoAdapter(BasePlatformAdapter):
         await self._put_reaction(channel_id, message_id, ACK_REACTION_EMOJI)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
-        """Phase 2: keep 👀 — do not swap to success/fail / tool-state reactions."""
-        del event, outcome
-        return
+        """Phase 3F: 👀 is a temporary ACK — remove after final delivery / abort.
+
+        Hermes fires this after final text delivery (or on cancel/failure), so
+        removal timing matches "final answer delivery complete". Best-effort;
+        never raises; never blocks the turn. Only deletes this Bot's own reactor
+        (actor-scoped DELETE API).
+        """
+        del outcome
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None) or ""
+        message_id = str(getattr(event, "message_id", None) or "").strip()
+        if chat_id:
+            # Best-effort Activity clear if a tool turn aborted without set_status_text(None).
+            try:
+                self.set_status_text(str(chat_id), None)
+            except Exception:
+                pass
+        if not chat_id or not message_id:
+            return
+        try:
+            _community, channel_id = split_chat_id(str(chat_id))
+        except ValueError:
+            return
+        await self._delete_reaction(channel_id, message_id, ACK_REACTION_EMOJI)
 
     async def _set_channel_typing(self, channel_id: str, active: bool) -> None:
         if self._http is None or self.has_fatal_error or not channel_id:
@@ -495,6 +534,35 @@ class NaoNaoAdapter(BasePlatformAdapter):
             return
         except Exception as exc:
             logger.debug("[naonao] reaction request failed: %s", redact(exc))
+
+    async def _delete_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        """Best-effort remove this Bot's reactor. Never raises. Idempotent."""
+        if self._http is None or self.has_fatal_error or not channel_id or not message_id:
+            return
+        enc = quote(str(emoji or ""), safe="")
+        if not enc:
+            return
+        try:
+            response = await self._http.request(
+                "DELETE",
+                f"{self._api_base}/api/v1/channels/{channel_id}/messages/{message_id}/reactions/{enc}",
+                headers={"Authorization": f"Bot {self._bot_token}"},
+                follow_redirects=False,
+            )
+            if response.status_code == 401:
+                await self._fatal_auth()
+                return
+            # 404 = already gone / never added — success for cleanup.
+            if response.status_code >= 400 and response.status_code != 404:
+                logger.debug(
+                    "[naonao] reaction delete failed status=%s emoji=%s",
+                    response.status_code,
+                    emoji,
+                )
+        except _FatalAuth:
+            return
+        except Exception as exc:
+            logger.debug("[naonao] reaction delete failed: %s", redact(exc))
 
     def prefers_fresh_final_streaming(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
@@ -1530,7 +1598,37 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=Non
     return {"error": redact(result.error) or "send_failed"}
 
 
+def _install_naonao_display_defaults() -> None:
+    """Declare NaoNao display defaults (telegram pattern): tool_progress off.
+
+    Exact root cause of Phase 3 Owner FAIL: Hermes global default
+    ``tool_progress=all`` for plugin platforms without ``_PLATFORM_DEFAULTS``
+    routes ``_progress_build_message`` → ``_progress_emit`` → progress_queue →
+    ``_send_progress_text`` → ``adapter.send()``, creating a chat Message such as
+    ``🔍 Searching the web for …``.
+
+    Live status (``supports_status_text`` / ``set_status_text`` → Activity API) is
+    independent and keeps working when tool_progress is off.
+
+    Do NOT use ``display_tier="low"``: that also sets ``streaming=False``, which
+    disables Phase 1 same-message streaming via ``StreamingConfig.enabled_for``.
+    Injecting a telegram-shaped row keeps ``streaming=None`` (follow global
+    ``streaming.enabled``) while silencing progress Message bubbles.
+    """
+    try:
+        from gateway import display_config as dc
+
+        dc._PLATFORM_DEFAULTS["naonao"] = {
+            **dc._TIER_HIGH,
+            "tool_progress": "off",
+            "busy_ack_detail": False,
+        }
+    except Exception:
+        logger.debug("[naonao] display defaults install skipped", exc_info=True)
+
+
 def register(ctx) -> None:
+    _install_naonao_display_defaults()
     ctx.register_platform(
         name="naonao",
         label="NaoNao",

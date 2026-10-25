@@ -240,8 +240,8 @@ class Phase2TypingReactionTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_on_processing_complete_is_noop_keeps_eyes(self):
-        """Phase 2 must not swap 👀 → ✅."""
+    def test_on_processing_complete_deletes_eyes_ack(self):
+        """Phase 3F: 👀 is temporary — DELETE after final (no ✅ swap)."""
         calls = []
 
         def handler(method, url, headers, body):
@@ -272,7 +272,10 @@ class Phase2TypingReactionTests(unittest.TestCase):
             await ad.on_processing_complete(event, "SUCCESS")
 
         asyncio.run(run())
-        self.assertEqual(calls, [])
+        deletes = [c for c in calls if c.startswith("DELETE ") and "/reactions/" in c]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("/messages/src1/reactions/", deletes[0])
+        self.assertFalse(any("PUT " in c and "/reactions/" in c for c in calls))
 
     def test_source_message_id_from_gateway_mention(self):
         ad = _adapter(_Http(lambda *a: _Response(200)))
