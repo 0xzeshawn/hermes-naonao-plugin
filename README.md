@@ -2,7 +2,7 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.1.0**
+**Plugin version: 1.1.1**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
@@ -80,7 +80,7 @@ platforms:
 
 ## Upgrade from v1.0.1
 
-v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit.
+v1.0.1 shipped with `SUPPORTS_MESSAGE_EDITING = False` (complete messages only). v1.1.0 restores same-message streaming via Bot Message Edit. v1.1.1 recovers correctly when a streaming edit permanently fails (403/404) so Hermes can deliver the complete answer via fallback instead of leaving a stuck partial.
 
 Update the installed plugin, then restart the gateway:
 
@@ -165,7 +165,7 @@ PY
 hermes config get streaming.enabled
 ```
 
-Expect: `version=1.1.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+Expect: `version=1.1.1`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
 
 ## Test with @Bot
 

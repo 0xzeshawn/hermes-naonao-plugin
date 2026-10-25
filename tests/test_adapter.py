@@ -1265,7 +1265,7 @@ class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(patches[-1]["content"], "ABCD")
         self.assertLess(len(patches), 4)
 
-    async def test_403_does_not_post_replacement(self):
+    async def test_403_signals_failure_does_not_post_replacement(self):
         adapter = self._adapter()
 
         def handler(method, url, headers, body):
@@ -1278,13 +1278,14 @@ class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
         chat = "community_a:channel_x"
         created = await adapter.send(chat, "hi")
         result = await adapter.edit_message(chat, created.message_id, "nope", finalize=True)
-        self.assertTrue(result.success)
-        self.assertTrue(result.raw_response.get("skipped"))
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_kind, "forbidden")
         self.assertTrue(result.raw_response.get("naonao_edit_dead"))
+        self.assertFalse(result.raw_response.get("skipped"))
         post_count = sum(1 for c in adapter._http.calls if c["method"].upper() == "POST")
         self.assertEqual(post_count, 1)
 
-    async def test_404_does_not_post_replacement(self):
+    async def test_404_signals_failure_does_not_post_replacement(self):
         adapter = self._adapter()
 
         def handler(method, url, headers, body):
@@ -1297,8 +1298,10 @@ class StreamingCapabilityTests(unittest.IsolatedAsyncioTestCase):
         chat = "community_a:channel_x"
         created = await adapter.send(chat, "hi")
         result = await adapter.edit_message(chat, created.message_id, "gone", finalize=True)
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_kind, "not_found")
         self.assertTrue(result.raw_response.get("naonao_edit_dead"))
+        self.assertFalse(result.raw_response.get("skipped"))
         post_count = sum(1 for c in adapter._http.calls if c["method"].upper() == "POST")
         self.assertEqual(post_count, 1)
 

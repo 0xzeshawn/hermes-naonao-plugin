@@ -1,4 +1,4 @@
-"""Lightweight capability markers for NaoNao plugin v1.1.0+."""
+"""Lightweight capability markers for NaoNao plugin v1.1.1+."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class CapabilityParityTests(unittest.TestCase):
         text = MANIFEST.read_text(encoding="utf-8")
         m = re.search(r"(?m)^version:\s*([^\s#]+)", text)
         self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "1.1.0")
+        self.assertEqual(m.group(1), "1.1.1")
 
     def test_supports_message_editing_true(self) -> None:
         tree = ast.parse(ADAPTER.read_text(encoding="utf-8"))

@@ -238,9 +238,54 @@ class NaoNaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _skipped_edit(message_id: str, **extra: Any) -> SendResult:
-        """Tell Hermes the edit was deferred/terminal without triggering fallback send()."""
+        """Coalesce/defer only — Hermes must NOT treat this as final delivery.
+
+        Used when a newer edit superseded this one, or the lane is mid-flush.
+        Must never be used for permanent HTTP failures (403/404) or exhausted
+        retries: those must return success=False so GatewayStreamConsumer can
+        enter fallback and the turn reconciler does not set already_sent.
+        """
         payload = {"skipped": True, **extra}
         return SendResult(success=True, message_id=str(message_id or "") or None, raw_response=payload)
+
+    @staticmethod
+    def _failed_edit(
+        message_id: str,
+        *,
+        error: str,
+        error_kind: str,
+        retryable: bool = False,
+        **extra: Any,
+    ) -> SendResult:
+        """Permanent / exhausted edit failure — surface to Hermes fallback contract."""
+        payload = {"naonao_edit_failed": True, **extra}
+        result = SendResult(
+            success=False,
+            message_id=str(message_id or "") or None,
+            error=str(error or "edit_failed"),
+            error_kind=str(error_kind or "unknown"),
+            retryable=bool(retryable),
+            raw_response=payload,
+        )
+        return result
+
+    def _dead_edit_result(self, message_id: str, *, finalize: bool = False) -> SendResult:
+        lane = self._edit_lanes.get(str(message_id or "")) or {}
+        last = lane.get("last_result")
+        if (
+            last is not None
+            and not getattr(last, "success", True)
+            and getattr(last, "error_kind", None)
+        ):
+            # Preserve the original permanent failure for Hermes reconcile/fallback.
+            return last
+        return self._failed_edit(
+            message_id,
+            error="edit_lane_dead",
+            error_kind="not_found",
+            naonao_edit_dead=True,
+            finalize=finalize,
+        )
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
@@ -272,7 +317,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
                     "[naonao] edit aborted; message is dead message_id=%s finalize=%s",
                     mid, finalize,
                 )
-                return self._skipped_edit(mid, naonao_edit_dead=True)
+                return self._dead_edit_result(mid, finalize=finalize)
 
             # Newest full accumulated content wins; intermediate versions are dropped.
             lane["pending"] = text
@@ -295,7 +340,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             await done_event.wait()
             async with lane["lock"]:
                 if lane["dead"]:
-                    return self._skipped_edit(mid, naonao_edit_dead=True)
+                    return self._dead_edit_result(mid, finalize=finalize)
                 if lane["flushing"]:
                     return lane["last_result"] or self._skipped_edit(mid, naonao_edit_coalesced=True)
                 if lane["pending"] is None and not lane["pending_finalize"]:
@@ -320,7 +365,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
         while True:
             async with lane["lock"]:
                 if lane["dead"]:
-                    return self._skipped_edit(message_id, naonao_edit_dead=True)
+                    return self._dead_edit_result(message_id, finalize=force_immediate)
                 channel_id = str(lane.get("channel_id") or "")
                 latest = lane["pending"]
                 do_finalize = bool(lane["pending_finalize"])
@@ -346,11 +391,18 @@ class NaoNaoAdapter(BasePlatformAdapter):
             last_result = result
             async with lane["lock"]:
                 raw = result.raw_response if isinstance(result.raw_response, dict) else {}
-                if raw.get("naonao_edit_dead"):
+                if raw.get("naonao_edit_dead") or (
+                    not result.success
+                    and (getattr(result, "error_kind", None) in ("forbidden", "not_found"))
+                ):
                     lane["dead"] = True
                     return result
                 if result.success and not raw.get("naonao_edit_gave_up"):
                     lane["last_flush_at"] = time.monotonic()
+                if not result.success and raw.get("naonao_edit_gave_up"):
+                    # Exhausted retries: do not mark dead forever — Hermes may
+                    # still finalize via fallback send; avoid fake success.
+                    return result
                 if lane["pending"] is not None or lane["pending_finalize"]:
                     force_immediate = bool(lane["pending_finalize"] or force_immediate)
                     continue
@@ -368,10 +420,21 @@ class NaoNaoAdapter(BasePlatformAdapter):
             status = getattr(last, "_http_status", None)
             if kind in ("forbidden", "not_found") or status in (403, 404):
                 logger.error(
-                    "[naonao] edit permanently failed message_id=%s status=%s error=%s — keeping partial, no POST",
+                    "[naonao] edit permanently failed message_id=%s status=%s error=%s — "
+                    "signaling failure for Hermes fallback (no fake delivery)",
                     message_id, status or "-", redact(last.error),
                 )
-                return self._skipped_edit(message_id, naonao_edit_dead=True, finalize=finalize)
+                failed = self._failed_edit(
+                    message_id,
+                    error=str(last.error or kind),
+                    error_kind=str(kind if kind in ("forbidden", "not_found") else (
+                        "forbidden" if status == 403 else "not_found"
+                    )),
+                    naonao_edit_dead=True,
+                    finalize=finalize,
+                )
+                failed._http_status = status
+                return failed
             if not getattr(last, "retryable", False):
                 break
             if attempt >= EDIT_MAX_ATTEMPTS:
@@ -383,20 +446,25 @@ class NaoNaoAdapter(BasePlatformAdapter):
                 message_id, attempt, EDIT_MAX_ATTEMPTS, delay,
             )
             await asyncio.sleep(delay)
-            # Prefer newest coalesced content if another edit arrived while we slept —
-            # under the lane lock this is still `content`, but keep the parameter for clarity.
 
-        # Exhausted / non-retryable: never let Hermes fallback-send a second bubble.
+        # Exhausted / non-retryable: surface failure so Hermes can fallback-send
+        # the complete answer instead of suppressing final delivery via already_sent.
         logger.error(
-            "[naonao] edit gave up message_id=%s finalize=%s error=%s — keeping partial, no POST",
+            "[naonao] edit gave up message_id=%s finalize=%s error=%s — signaling failure for fallback",
             message_id, finalize, redact(last.error if last else ""),
         )
-        return self._skipped_edit(
+        failed = self._failed_edit(
             message_id,
+            error=str((last.error if last else None) or "edit_gave_up"),
+            error_kind=str(getattr(last, "error_kind", None) or "transient"),
+            retryable=False,
             naonao_edit_gave_up=True,
             finalize=finalize,
             last_error=redact(last.error if last else ""),
         )
+        if last is not None:
+            failed._http_status = getattr(last, "_http_status", None)
+        return failed
 
     async def _patch_message(self, channel_id: str, message_id: str, content: str) -> SendResult:
         if self._http is None:

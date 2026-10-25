@@ -328,7 +328,7 @@ class Phase1DE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.messages[mid], "recovered")
         self.assertEqual(len(store.posts), 1)
 
-    async def test_07_403_no_replacement_post(self):
+    async def test_07_403_signals_failure_no_replacement_post(self):
         adapter, store, http = self._make()
         chat = "community_a:channel_x"
         created = await adapter.send(chat, "partial")
@@ -336,12 +336,14 @@ class Phase1DE2ETests(unittest.IsolatedAsyncioTestCase):
         store.fail_mode = "403"
         before = len(store.posts)
         r = await adapter.edit_message(chat, mid, "try", finalize=True)
-        self.assertTrue(r.success)
-        self.assertTrue(r.raw_response.get("naonao_edit_dead") or r.raw_response.get("skipped"))
+        # Permanent edit failure must NOT fake delivery (Phase 1G / Bug B).
+        self.assertFalse(r.success)
+        self.assertEqual(r.error_kind, "forbidden")
+        self.assertTrue((r.raw_response or {}).get("naonao_edit_dead"))
         self.assertEqual(len(store.posts), before)
         self.assertEqual(store.messages[mid], "partial")
 
-    async def test_08_404_no_replacement_post(self):
+    async def test_08_404_signals_failure_no_replacement_post(self):
         adapter, store, _ = self._make()
         chat = "community_a:channel_x"
         created = await adapter.send(chat, "partial")
@@ -349,7 +351,9 @@ class Phase1DE2ETests(unittest.IsolatedAsyncioTestCase):
         store.fail_mode = "404"
         before = len(store.posts)
         r = await adapter.edit_message(chat, mid, "try", finalize=True)
-        self.assertTrue(r.success)
+        self.assertFalse(r.success)
+        self.assertEqual(r.error_kind, "not_found")
+        self.assertTrue((r.raw_response or {}).get("naonao_edit_dead"))
         self.assertEqual(len(store.posts), before)
 
     async def test_09_429_backoff_then_latest(self):
@@ -476,7 +480,8 @@ class Phase1DE2ETests(unittest.IsolatedAsyncioTestCase):
         # Kill B only; A still editable
         store.fail_mode = "403"
         dead = await adapter.edit_message("c1:ch", b.message_id, "B_DEAD", finalize=True)
-        self.assertTrue(dead.raw_response.get("skipped") or dead.raw_response.get("naonao_edit_dead"))
+        self.assertFalse(dead.success)
+        self.assertTrue((dead.raw_response or {}).get("naonao_edit_dead"))
         store.fail_mode = None
         await adapter.edit_message("c1:ch", a.message_id, "A_STILL", finalize=True)
         self.assertEqual(store.messages[a.message_id], "A_STILL")
