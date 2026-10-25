@@ -38,9 +38,33 @@ def _load_adapter():
 
 adapter_mod = _load_adapter()
 NaoNaoAdapter = adapter_mod.NaoNaoAdapter
+register = adapter_mod.register
 
 from gateway.config import PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+
+class _Ctx:
+    def register_platform(self, **kwargs):
+        platform_registry.register(PlatformEntry(
+            name=kwargs["name"],
+            label=kwargs["label"],
+            adapter_factory=kwargs["adapter_factory"],
+            check_fn=kwargs["check_fn"],
+            ensure_deps_fn=kwargs.get("ensure_deps_fn"),
+            validate_config=kwargs.get("validate_config"),
+            is_connected=kwargs.get("is_connected"),
+            required_env=list(kwargs.get("required_env") or []),
+            install_hint=kwargs.get("install_hint") or "",
+            allowed_users_env=kwargs.get("allowed_users_env") or "",
+            allow_all_env=kwargs.get("allow_all_env") or "",
+            cron_deliver_env_var=kwargs.get("cron_deliver_env_var") or "",
+            source="plugin",
+        ))
+
+
+register(_Ctx())
 
 
 class _Response:

@@ -9,6 +9,8 @@ Uses NaoNao Public Bot API v1 only:
     command.invoked
     POST /api/v1/channels/:channelId/messages
     PATCH /api/v1/channels/:channelId/messages/:messageId
+    POST /api/v1/channels/:channelId/typing
+    PUT  /api/v1/channels/:channelId/messages/:messageId/reactions/:emoji
 
 Hermes Gateway runs the agent. This module does not call Hermes /v1/runs.
 """
@@ -24,7 +26,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import extra_or_secret as _extra_or_secret
@@ -45,6 +47,8 @@ SESSION_SKEW_SECONDS = 15
 EDIT_THROTTLE_SECONDS = 0.35
 EDIT_MAX_ATTEMPTS = 3
 EDIT_RETRY_AFTER_CAP_SECONDS = 10.0
+# Phase 2: acknowledge the triggering user message (not tool-state reactions).
+ACK_REACTION_EMOJI = "👀"
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 _COMMAND_NAME = re.compile(r"^[a-z0-9_-]{1,32}$")
 _NOT_ASSIGNED = (
@@ -203,12 +207,103 @@ class NaoNaoAdapter(BasePlatformAdapter):
                 "[naonao] outbound send success chat_id=%s message_id=%s",
                 chat_id, result.message_id or "",
             )
+            # First streamed POST clears Typing; server also clears on create.
+            await self._set_channel_typing(channel_id, False)
         else:
             logger.info(
                 "[naonao] outbound send failed chat_id=%s status=%s error=%s",
                 chat_id, getattr(result, "_http_status", "") or "-", redact(result.error),
             )
         return result
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Best-effort Typing ON (Hermes _keep_typing refreshes ~2s). Never raises."""
+        del metadata
+        try:
+            _community, channel_id = split_chat_id(chat_id)
+        except ValueError:
+            return
+        await self._set_channel_typing(channel_id, True)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Best-effort Typing OFF. Never raises."""
+        try:
+            _community, channel_id = split_chat_id(chat_id)
+        except ValueError:
+            return
+        await self._set_channel_typing(channel_id, False)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add 👀 on the triggering user message. Best-effort; never blocks the turn."""
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None) or ""
+        message_id = str(getattr(event, "message_id", None) or "").strip()
+        if not chat_id or not message_id:
+            return
+        try:
+            _community, channel_id = split_chat_id(str(chat_id))
+        except ValueError:
+            return
+        await self._put_reaction(channel_id, message_id, ACK_REACTION_EMOJI)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        """Phase 2: keep 👀 — do not swap to success/fail / tool-state reactions."""
+        del event, outcome
+        return
+
+    async def _set_channel_typing(self, channel_id: str, active: bool) -> None:
+        if self._http is None or self.has_fatal_error or not channel_id:
+            return
+        try:
+            response = await self._http.request(
+                "POST",
+                f"{self._api_base}/api/v1/channels/{channel_id}/typing",
+                headers={
+                    "Authorization": f"Bot {self._bot_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"active": bool(active)},
+                follow_redirects=False,
+            )
+            if response.status_code == 401:
+                await self._fatal_auth()
+                return
+            if response.status_code >= 400:
+                logger.debug(
+                    "[naonao] typing %s failed status=%s",
+                    "on" if active else "off",
+                    response.status_code,
+                )
+        except _FatalAuth:
+            return
+        except Exception as exc:
+            logger.debug("[naonao] typing request failed: %s", redact(exc))
+
+    async def _put_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        if self._http is None or self.has_fatal_error or not channel_id or not message_id:
+            return
+        enc = quote(str(emoji or ""), safe="")
+        if not enc:
+            return
+        try:
+            response = await self._http.request(
+                "PUT",
+                f"{self._api_base}/api/v1/channels/{channel_id}/messages/{message_id}/reactions/{enc}",
+                headers={"Authorization": f"Bot {self._bot_token}"},
+                follow_redirects=False,
+            )
+            if response.status_code == 401:
+                await self._fatal_auth()
+                return
+            if response.status_code >= 400:
+                logger.debug(
+                    "[naonao] reaction put failed status=%s emoji=%s",
+                    response.status_code,
+                    emoji,
+                )
+        except _FatalAuth:
+            return
+        except Exception as exc:
+            logger.debug("[naonao] reaction request failed: %s", redact(exc))
 
     def prefers_fresh_final_streaming(
         self, content: str, metadata: Optional[Dict[str, Any]] = None

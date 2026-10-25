@@ -1,4 +1,4 @@
-"""Lightweight capability markers for NaoNao plugin v1.1.1+."""
+"""Lightweight capability markers for NaoNao plugin v1.2.0+."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ MANIFEST = ROOT / "plugin.yaml"
 
 
 class CapabilityParityTests(unittest.TestCase):
-    def test_plugin_yaml_version_is_1_1_0(self) -> None:
+    def test_plugin_yaml_version_is_1_2_0(self) -> None:
         text = MANIFEST.read_text(encoding="utf-8")
         m = re.search(r"(?m)^version:\s*([^\s#]+)", text)
         self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "1.1.1")
+        self.assertEqual(m.group(1), "1.2.0")
 
     def test_supports_message_editing_true(self) -> None:
         tree = ast.parse(ADAPTER.read_text(encoding="utf-8"))
@@ -46,6 +46,13 @@ class CapabilityParityTests(unittest.TestCase):
                         methods.add(item.name)
         self.assertIn("edit_message", methods)
         self.assertIn("send", methods)
+        self.assertIn("send_typing", methods)
+        self.assertIn("stop_typing", methods)
+        self.assertIn("on_processing_start", methods)
+
+    def test_ack_reaction_constant(self) -> None:
+        text = ADAPTER.read_text(encoding="utf-8")
+        self.assertIn('ACK_REACTION_EMOJI = "👀"', text)
 
 
 if __name__ == "__main__":
