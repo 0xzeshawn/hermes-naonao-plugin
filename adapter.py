@@ -974,6 +974,23 @@ class NaoNaoAdapter(BasePlatformAdapter):
             message_id=str(message.get("id") or "") or None,
             scope_id=community_id,
         )
+        # Hermes MessageEvent first-class reply fields (NOT metadata).
+        # Admission may reject nonempty metadata; reply context must use reply_to_*.
+        reply = message.get("reply") if isinstance(message.get("reply"), dict) else {}
+        reply_id = str(message.get("replyToMessageId") or reply.get("messageId") or "").strip() or None
+        reply_excerpt = str(reply.get("excerpt") or reply.get("content") or "").strip()
+        if reply_id and not reply_excerpt and (reply.get("deleted") or reply.get("removed")):
+            reply_excerpt = "(original message unavailable)"
+        reply_author_name = str(reply.get("authorName") or "").strip() or None
+        reply_author_id = str(reply.get("authorId") or "").strip() or None
+        reply_author_type = str(reply.get("authorType") or "user").strip().lower()
+        reply_to_is_own = bool(
+            reply_id
+            and reply_author_type == "bot"
+            and self._bot_id
+            and reply_author_id
+            and str(reply_author_id) == str(self._bot_id)
+        )
         return MessageEvent(
             text=strip_leading_mention(content, self._bot_name),
             message_type=MessageType.TEXT,
@@ -982,6 +999,11 @@ class NaoNaoAdapter(BasePlatformAdapter):
             source=source,
             message_id=str(message.get("id") or "") or None,
             timestamp=timestamp,
+            reply_to_message_id=reply_id,
+            reply_to_text=(reply_excerpt or None) if reply_id else None,
+            reply_to_author_id=reply_author_id if reply_id else None,
+            reply_to_author_name=reply_author_name if reply_id else None,
+            reply_to_is_own_message=reply_to_is_own,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,

@@ -121,7 +121,19 @@ class _Socket:
         self._closed.set()
 
 
-def _mention(event_id="evt_1", community="community_a", channel="channel_x", content="@测试机器人 你好", bot_id="bot_1", actor_id=""):
+def _mention(event_id="evt_1", community="community_a", channel="channel_x", content="@测试机器人 你好", bot_id="bot_1", actor_id="", reply=None, reply_to_message_id=""):
+    message = {
+        "id": "msg_1",
+        "content": content,
+        "createdAt": "2026-10-13T04:00:00.000Z",
+        "hasAttachments": False,
+        "attachmentCount": 0,
+        "replyToMessageId": reply_to_message_id or "",
+    }
+    if reply is not None:
+        message["reply"] = reply
+        if not message["replyToMessageId"]:
+            message["replyToMessageId"] = str(reply.get("messageId") or "")
     return {
         "version": "1",
         "id": event_id,
@@ -132,13 +144,7 @@ def _mention(event_id="evt_1", community="community_a", channel="channel_x", con
         "community": {"id": community},
         "channel": {"id": channel},
         "actor": {"type": "user", "username": "member", **({"id": actor_id} if actor_id else {})},
-        "message": {
-            "id": "msg_1",
-            "content": content,
-            "createdAt": "2026-10-13T04:00:00.000Z",
-            "hasAttachments": False,
-            "attachmentCount": 0,
-        },
+        "message": message,
         "installation": {"id": "inst_1"},
     }
 
@@ -415,6 +421,58 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         adapter._seen = []
         adapter._http_box = http
         return adapter
+
+    def test_build_mention_event_maps_structured_reply_context(self):
+        adapter = self._adapter(_ok_api(), [])
+        adapter._bot_id = "bot_1"
+        event = adapter.build_mention_event(
+            _mention(
+                content="@测试机器人 对，就是这个。",
+                reply_to_message_id="parent_1",
+                reply={
+                    "messageId": "parent_1",
+                    "authorName": "alice",
+                    "authorId": "user_alice",
+                    "authorType": "user",
+                    "excerpt": "数据库是不是 MongoDB？",
+                    "deleted": False,
+                    "removed": False,
+                },
+            ),
+            3,
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event.reply_to_message_id, "parent_1")
+        self.assertIn("MongoDB", event.reply_to_text or "")
+        self.assertEqual(event.reply_to_author_name, "alice")
+        self.assertEqual(event.reply_to_author_id, "user_alice")
+        self.assertFalse(event.reply_to_is_own_message)
+        # Reply must not be stuffed into metadata (admission / PR #1 concern).
+        self.assertNotIn("reply", event.metadata)
+        self.assertNotIn("replyToMessageId", event.metadata)
+
+        deleted = adapter.build_mention_event(
+            _mention(
+                content="@测试机器人 ok",
+                reply_to_message_id="gone_1",
+                reply={
+                    "messageId": "gone_1",
+                    "authorName": "",
+                    "authorId": "",
+                    "authorType": "user",
+                    "excerpt": "",
+                    "deleted": True,
+                    "removed": False,
+                },
+            ),
+            4,
+        )
+        self.assertEqual(deleted.reply_to_message_id, "gone_1")
+        self.assertEqual(deleted.reply_to_text, "(original message unavailable)")
+
+        plain = adapter.build_mention_event(_mention(content="@测试机器人 你好"), 5)
+        self.assertIsNone(plain.reply_to_message_id)
+        self.assertIsNone(plain.reply_to_text)
 
     async def test_identify_reply_ack_and_dedupe(self):
         sock = _Socket([
