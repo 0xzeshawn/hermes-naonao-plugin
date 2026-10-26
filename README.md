@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.3.1**
+**Plugin version: 1.3.2**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.1**.
+Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.2**.
 
 ## What it does
 
@@ -146,8 +146,9 @@ platforms:
 | v1.2.0 | Typing + temporary 👀 acknowledgement |
 | v1.3.0 | Safe Agent / Tool Activity categories |
 | v1.3.1 | Tool status via Activity only; 👀 removed after final delivery |
+| v1.3.2 | Structured reply context mapped to Hermes `reply_to_*` fields |
 
-Recommended: **v1.3.1**.
+Recommended: **v1.3.2**.
 
 ## Upgrade
 
@@ -234,7 +235,7 @@ PY
 hermes config get streaming.enabled
 ```
 
-Expect: `version=1.3.1`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+Expect: `version=1.3.2`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
 
 ## Test with @Bot
 
@@ -314,6 +315,7 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | Temporary 👀 ACK (removed after final) | Supported (v1.2.0+; cleanup since v1.3.1) |
 | Safe tool activity states | Supported (v1.3.0+) |
 | Tool status never becomes a Message | Supported (v1.3.1+) |
+| Structured reply context (`reply_to_*`) | Supported (v1.3.2+) |
 | Images, files, voice, video | Not currently supported |
 | Ordinary channel messages that do not @ the bot | Not delivered |
 
@@ -329,7 +331,7 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | `NaoNao Bot is not currently assigned to an external connector` | In the Bot's 运行方式, choose 启用外部机器人. An AI Agent bot will not connect. |
 | The bot never replies, and the gateway log shows the user is unauthorized | Set `NAONAO_ALLOWED_USERS` or `NAONAO_ALLOW_ALL_USERS` as above. |
 | Sending fails with a permissions error | Confirm the app is installed in that community and has 查看频道 and 发送消息 on that channel. |
-| Streaming arrives as one full message | Confirm plugin ≥ `1.1.0` (recommend `1.3.1`), `SUPPORTS_MESSAGE_EDITING=True`, `streaming.enabled=true`, then `hermes gateway restart`. Also confirm the model provider emits deltas. |
+| Streaming arrives as one full message | Confirm plugin ≥ `1.1.0` (recommend `1.3.2`), `SUPPORTS_MESSAGE_EDITING=True`, `streaming.enabled=true`, then `hermes gateway restart`. Also confirm the model provider emits deltas. |
 | Tool status appears as a normal chat message | Upgrade to plugin ≥ **v1.3.1** and restart the gateway. Do not filter message text by emoji or phrase. |
 | Typing or Activity looks stuck | Server TTL clears them (~10s typing / ~12s activity). Check gateway connectivity; sending a Bot message also clears both for that Bot. |
 | No Tool Activity | Confirm Hermes actually invoked a tool. Ordinary generation does not invent Activity. |
