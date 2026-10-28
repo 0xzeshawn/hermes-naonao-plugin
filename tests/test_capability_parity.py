@@ -1,4 +1,4 @@
-"""Lightweight capability markers for NaoNao plugin v1.3.2+."""
+"""Lightweight capability markers for NaoNao plugin v1.3.3+."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ MANIFEST = ROOT / "plugin.yaml"
 
 
 class CapabilityParityTests(unittest.TestCase):
-    def test_plugin_yaml_version_is_1_3_2(self) -> None:
+    def test_plugin_yaml_version_is_1_3_3(self) -> None:
         text = MANIFEST.read_text(encoding="utf-8")
         m = re.search(r"(?m)^version:\s*([^\s#]+)", text)
         self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "1.3.2")
+        self.assertEqual(m.group(1), "1.3.3")
 
     def test_supports_message_editing_true(self) -> None:
         tree = ast.parse(ADAPTER.read_text(encoding="utf-8"))

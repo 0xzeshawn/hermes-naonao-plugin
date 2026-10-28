@@ -40,14 +40,17 @@ optional_env:
     description: "Set true to admit every NaoNao sender with a stable actor id"
     prompt: "Allow all NaoNao users (true/false)"
     password: false
-# Desktop Plugins settings form + plugins.entries.naonao.settings.
-# Platform YAML alternative: platforms.naonao.response_language (promoted into PlatformConfig.extra).
+# Desktop Plugins settings form + plugins.entries.naonao.settings (preferred).
+# Legacy/manual: platforms.naonao.response_language (PlatformConfig.extra). Explicit
+# plugin settings win over legacy platform config when the settings key is stored.
 config_schema:
   response_language:
     type: str
+    label: "Response Language / 回复语言"
     choices: [auto, zh-CN, en]
     default: zh-CN
     description: >
-      Soft default for agent reply language on NaoNao. zh-CN prefers Simplified Chinese,
-      en prefers English, auto leaves language to the model/conversation. Explicit user
-      language requests always take precedence. Not a hard lock and not post-hoc translation.
+      Sets the preferred default reply language for NaoNao. This is a soft model
+      preference, not a hard language lock; explicit user language requests may
+      override it, and behavior can vary by model. zh-CN prefers Simplified Chinese,
+      en prefers English, auto leaves language to the model/conversation.

@@ -84,11 +84,16 @@ _TOOL_ACTIVITY_CATEGORY: Dict[str, str] = {
 }
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 
-# Soft response-language preference (not a hard lock). Official config paths:
-#   platforms.naonao.response_language  → PlatformConfig.extra
-#   plugins.entries.naonao.settings.response_language  → config_schema / Desktop
+# Soft response-language preference (not a hard lock). Resolution order:
+#   1. explicit plugins.entries.naonao.settings.response_language (Desktop / config_schema)
+#   2. legacy platforms.naonao.response_language (PlatformConfig.extra / YAML)
+#   3. default zh-CN
+# Schema default is UI-only until the user Saves; it is never treated as an
+# explicit plugin setting (Hermes get_config does not inject config_schema.default).
 RESPONSE_LANGUAGE_DEFAULT = "zh-CN"
 RESPONSE_LANGUAGE_VALUES = frozenset({"auto", "zh-CN", "en"})
+# Sentinel: plugin-settings key absent (distinct from explicit null/empty).
+_RESPONSE_LANGUAGE_UNSET = object()
 NAONAO_CAPABILITY_HINT = (
     "You are replying in a NaoNao community channel. "
     "Send plain text. Files, images, and voice are not available on this adapter. "
@@ -175,6 +180,10 @@ def _read_platforms_naonao_response_language() -> Any:
 
 
 def _read_plugin_settings_response_language() -> Any:
+    """Return the stored plugin setting if the key exists; else ``_RESPONSE_LANGUAGE_UNSET``.
+
+    Key presence is required — schema default alone does not count as explicit.
+    """
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -193,7 +202,24 @@ def _read_plugin_settings_response_language() -> Any:
                 return settings.get("response_language")
     except Exception:
         logger.debug("[naonao] plugin settings response_language read skipped", exc_info=True)
-    return None
+    return _RESPONSE_LANGUAGE_UNSET
+
+
+def _explicit_plugin_response_language(*, plugin_get_config: Any = None) -> Any:
+    """Raw plugin setting when the key is stored; else ``_RESPONSE_LANGUAGE_UNSET``.
+
+    Hermes ``ctx.get_config(key, default)`` returns *default* when the key is absent and
+    does not apply ``config_schema.default``. Passing ``_RESPONSE_LANGUAGE_UNSET`` as that
+    default distinguishes absent from an explicit stored value (including ``zh-CN``).
+    """
+    if callable(plugin_get_config):
+        try:
+            value = plugin_get_config("response_language", _RESPONSE_LANGUAGE_UNSET)
+            if value is not _RESPONSE_LANGUAGE_UNSET:
+                return value
+        except Exception:
+            logger.debug("[naonao] plugin get_config response_language skipped", exc_info=True)
+    return _read_plugin_settings_response_language()
 
 
 def resolve_naonao_response_language(
@@ -201,7 +227,17 @@ def resolve_naonao_response_language(
     config: Any = None,
     plugin_get_config: Any = None,
 ) -> str:
-    """Resolve preference: platforms.naonao → plugin settings → default zh-CN."""
+    """Resolve preference: explicit plugin settings → legacy platform → default zh-CN.
+
+    Only a key actually present under ``plugins.entries.*.settings`` (or legacy
+    ``config``) counts as explicit plugin settings. Schema default is not explicit.
+    An explicit but invalid/empty plugin value normalizes to ``zh-CN`` and does not
+    fall through to platform config (the user already chose plugin settings).
+    """
+    plugin_raw = _explicit_plugin_response_language(plugin_get_config=plugin_get_config)
+    if plugin_raw is not _RESPONSE_LANGUAGE_UNSET:
+        return normalize_response_language(plugin_raw)
+
     platform_raw = None
     if config is not None:
         extra = getattr(config, "extra", None) or {}
@@ -210,19 +246,8 @@ def resolve_naonao_response_language(
     if platform_raw is None or str(platform_raw).strip() == "":
         platform_raw = _read_platforms_naonao_response_language()
 
-    plugin_raw = None
-    if callable(plugin_get_config):
-        try:
-            plugin_raw = plugin_get_config("response_language", None)
-        except Exception:
-            plugin_raw = None
-    if plugin_raw is None or str(plugin_raw).strip() == "":
-        plugin_raw = _read_plugin_settings_response_language()
-
-    for raw in (platform_raw, plugin_raw):
-        if raw is None or str(raw).strip() == "":
-            continue
-        return normalize_response_language(raw)
+    if platform_raw is not None and str(platform_raw).strip() != "":
+        return normalize_response_language(platform_raw)
     return RESPONSE_LANGUAGE_DEFAULT
 
 
