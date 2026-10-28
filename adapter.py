@@ -94,16 +94,19 @@ NAONAO_CAPABILITY_HINT = (
     "Send plain text. Files, images, and voice are not available on this adapter. "
     "The triggering message may still contain an @mention."
 )
+# Soft default-response-language instruction (shared by platform_hint + channel_prompt).
+# Stronger than "Prefer …" so ordinary other-language user messages still follow the
+# configured default, while explicit user language requests remain higher priority.
 _LANGUAGE_PREFERENCE_PROMPTS = {
     "zh-CN": (
-        "Prefer Simplified Chinese (简体中文) for responses by default, "
-        "including when the user's message is written in another language. "
-        "If the user explicitly requests a different response language, follow that request."
+        "Use Simplified Chinese (简体中文) as the default response language, "
+        "regardless of the language of the user's message. "
+        "If the user explicitly requests a different language, follow that explicit request for that response."
     ),
     "en": (
-        "Prefer English for responses by default, "
-        "including when the user's message is written in another language. "
-        "If the user explicitly requests a different response language, follow that request."
+        "Use English as the default response language, "
+        "regardless of the language of the user's message. "
+        "If the user explicitly requests a different language, follow that explicit request for that response."
     ),
 }
 
@@ -134,7 +137,11 @@ def normalize_response_language(raw: Any) -> str:
 
 
 def language_preference_instruction(response_language: str) -> str:
-    """Ephemeral soft-preference text for MessageEvent.channel_prompt. auto → empty."""
+    """Soft default-response-language instruction for platform_hint and channel_prompt.
+
+    auto → empty (no fixed language instruction). Not a hard lock: explicit user
+    language requests override the configured default.
+    """
     lang = normalize_response_language(response_language)
     if lang == "auto":
         return ""
@@ -142,7 +149,7 @@ def language_preference_instruction(response_language: str) -> str:
 
 
 def build_naonao_platform_hint(response_language: str = RESPONSE_LANGUAGE_DEFAULT) -> str:
-    """Capability hint plus optional soft language preference for register_platform."""
+    """Capability hint plus the same language instruction used for channel_prompt."""
     pref = language_preference_instruction(response_language)
     if not pref:
         return NAONAO_CAPABILITY_HINT

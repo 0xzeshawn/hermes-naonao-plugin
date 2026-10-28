@@ -108,28 +108,45 @@ class ResponseLanguageHelpersTest(unittest.TestCase):
     def test_zh_cn_prompt_soft_preference(self):
         text = adapter_mod.language_preference_instruction("zh-CN")
         self.assertIn("Simplified Chinese", text)
-        self.assertIn("explicitly requests", text)
+        self.assertIn("default response language", text)
+        self.assertIn("regardless of the language of the user's message", text)
+        self.assertIn("explicitly requests a different language", text)
+        self.assertIn("follow that explicit request", text)
         self.assertNotIn("Always", text)
         self.assertNotIn("Never", text)
+        self.assertNotIn("Prefer Simplified Chinese", text)
 
     def test_en_prompt_soft_preference(self):
         text = adapter_mod.language_preference_instruction("en")
-        self.assertIn("Prefer English", text)
-        self.assertIn("explicitly requests", text)
+        self.assertIn("Use English as the default response language", text)
+        self.assertIn("regardless of the language of the user's message", text)
+        self.assertIn("explicitly requests a different language", text)
+        self.assertIn("follow that explicit request", text)
         self.assertNotIn("Always", text)
+        self.assertNotIn("Never", text)
+        self.assertNotIn("Prefer English", text)
 
     def test_auto_has_no_fixed_preference(self):
         self.assertEqual(adapter_mod.language_preference_instruction("auto"), "")
         hint = adapter_mod.build_naonao_platform_hint("auto")
         self.assertEqual(hint, adapter_mod.NAONAO_CAPABILITY_HINT)
         self.assertNotIn("Simplified Chinese", hint)
-        self.assertNotIn("Prefer English", hint)
+        self.assertNotIn("Use English as the default", hint)
+        self.assertNotIn("default response language", hint)
+
+    def test_platform_hint_and_channel_prompt_share_same_instruction(self):
+        for lang in ("zh-CN", "en"):
+            instruction = adapter_mod.language_preference_instruction(lang)
+            hint = adapter_mod.build_naonao_platform_hint(lang)
+            self.assertTrue(hint.endswith(instruction))
+            self.assertIn(instruction, hint)
 
     def test_platform_hint_includes_zh_cn_by_default(self):
         hint = adapter_mod.build_naonao_platform_hint("zh-CN")
         self.assertIn("NaoNao community channel", hint)
         self.assertIn("Simplified Chinese", hint)
-        self.assertIn("explicitly requests", hint)
+        self.assertIn("regardless of the language of the user's message", hint)
+        self.assertIn("explicitly requests a different language", hint)
 
 
 class ResponseLanguageRuntimeTest(unittest.TestCase):
@@ -140,7 +157,8 @@ class ResponseLanguageRuntimeTest(unittest.TestCase):
         self.assertEqual(ad._response_language, "zh-CN")
         event = ad.build_mention_event(_mention(), 1)
         self.assertIsNotNone(event)
-        self.assertIn("Simplified Chinese", event.channel_prompt or "")
+        self.assertIn("Use Simplified Chinese", event.channel_prompt or "")
+        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
 
     def test_adapter_en_from_extra(self):
         with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
@@ -148,7 +166,8 @@ class ResponseLanguageRuntimeTest(unittest.TestCase):
             ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={"response_language": "en"}))
         self.assertEqual(ad._response_language, "en")
         event = ad.build_mention_event(_mention(), 1)
-        self.assertIn("Prefer English", event.channel_prompt or "")
+        self.assertIn("Use English as the default response language", event.channel_prompt or "")
+        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
         self.assertNotIn("Simplified Chinese", event.channel_prompt or "")
 
     def test_adapter_auto_clears_channel_prompt(self):
@@ -181,7 +200,8 @@ class ResponseLanguageRuntimeTest(unittest.TestCase):
              unittest.mock.patch.object(adapter_mod, "_install_naonao_display_defaults"):
             adapter_mod.register(ctx)
         hint = ctx.kwargs.get("platform_hint") or ""
-        self.assertIn("Simplified Chinese", hint)
+        self.assertIn("Use Simplified Chinese", hint)
+        self.assertIn("regardless of the language of the user's message", hint)
         self.assertIn("NaoNao community channel", hint)
         self.assertEqual(ctx.kwargs.get("name"), "naonao")
 
@@ -203,7 +223,8 @@ class ResponseLanguageRuntimeTest(unittest.TestCase):
             adapter_mod.register(ctx)
         hint = ctx.kwargs.get("platform_hint") or ""
         self.assertNotIn("Simplified Chinese", hint)
-        self.assertNotIn("Prefer English", hint)
+        self.assertNotIn("Use English as the default", hint)
+        self.assertNotIn("default response language", hint)
 
     def test_reply_mapping_unchanged_with_language_prompt(self):
         with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
@@ -224,7 +245,8 @@ class ResponseLanguageRuntimeTest(unittest.TestCase):
         self.assertIn("专属助手", event.reply_to_text or "")
         self.assertTrue(event.reply_to_is_own_message)
         self.assertNotIn("reply", event.metadata)
-        self.assertIn("Simplified Chinese", event.channel_prompt or "")
+        self.assertIn("Use Simplified Chinese", event.channel_prompt or "")
+        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
 
 
 if __name__ == "__main__":

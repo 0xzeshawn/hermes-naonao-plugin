@@ -146,8 +146,8 @@ Supported values:
 
 | Value | Behavior |
 |---|---|
-| `zh-CN` | Prefer Simplified Chinese by default (including when the user writes in another language) |
-| `en` | Prefer English by default |
+| `zh-CN` | Default response language is Simplified Chinese, regardless of the user's message language |
+| `en` | Default response language is English, regardless of the user's message language |
 | `auto` | No fixed default; follow the conversation / model |
 
 Explicit user requests for another language always take precedence over the configured default.
