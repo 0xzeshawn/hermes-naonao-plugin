@@ -1,7 +1,8 @@
 name: naonao
 label: NaoNao
 kind: platform
-version: 1.3.2
+version: 1.3.3
+manifest_version: 2
 description: >
   NaoNao messaging platform adapter for Hermes Agent.
   Connects with a NaoNao Bot Token, receives message.bot_mention and
@@ -39,3 +40,14 @@ optional_env:
     description: "Set true to admit every NaoNao sender with a stable actor id"
     prompt: "Allow all NaoNao users (true/false)"
     password: false
+# Desktop Plugins settings form + plugins.entries.naonao.settings.
+# Platform YAML alternative: platforms.naonao.response_language (promoted into PlatformConfig.extra).
+config_schema:
+  response_language:
+    type: str
+    choices: [auto, zh-CN, en]
+    default: zh-CN
+    description: >
+      Soft default for agent reply language on NaoNao. zh-CN prefers Simplified Chinese,
+      en prefers English, auto leaves language to the model/conversation. Explicit user
+      language requests always take precedence. Not a hard lock and not post-hoc translation.

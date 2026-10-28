@@ -84,6 +84,140 @@ _TOOL_ACTIVITY_CATEGORY: Dict[str, str] = {
 }
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 
+# Soft response-language preference (not a hard lock). Official config paths:
+#   platforms.naonao.response_language  → PlatformConfig.extra
+#   plugins.entries.naonao.settings.response_language  → config_schema / Desktop
+RESPONSE_LANGUAGE_DEFAULT = "zh-CN"
+RESPONSE_LANGUAGE_VALUES = frozenset({"auto", "zh-CN", "en"})
+NAONAO_CAPABILITY_HINT = (
+    "You are replying in a NaoNao community channel. "
+    "Send plain text. Files, images, and voice are not available on this adapter. "
+    "The triggering message may still contain an @mention."
+)
+_LANGUAGE_PREFERENCE_PROMPTS = {
+    "zh-CN": (
+        "Prefer Simplified Chinese (简体中文) for responses by default, "
+        "including when the user's message is written in another language. "
+        "If the user explicitly requests a different response language, follow that request."
+    ),
+    "en": (
+        "Prefer English for responses by default, "
+        "including when the user's message is written in another language. "
+        "If the user explicitly requests a different response language, follow that request."
+    ),
+}
+
+
+def normalize_response_language(raw: Any) -> str:
+    """Map a configured value to auto|zh-CN|en. Invalid/empty → default zh-CN."""
+    if raw is None:
+        return RESPONSE_LANGUAGE_DEFAULT
+    text = str(raw).strip().replace("_", "-")
+    if not text:
+        return RESPONSE_LANGUAGE_DEFAULT
+    key = text.lower()
+    if key == "auto":
+        return "auto"
+    if key in ("en", "en-us", "en-gb"):
+        return "en"
+    if key in ("zh-cn", "zh", "zh-hans"):
+        return "zh-CN"
+    # Case variants of the canonical tokens already covered by lowercasing above.
+    if text in RESPONSE_LANGUAGE_VALUES:
+        return text
+    logger.warning(
+        "[naonao] invalid response_language=%r; falling back to %s",
+        raw,
+        RESPONSE_LANGUAGE_DEFAULT,
+    )
+    return RESPONSE_LANGUAGE_DEFAULT
+
+
+def language_preference_instruction(response_language: str) -> str:
+    """Ephemeral soft-preference text for MessageEvent.channel_prompt. auto → empty."""
+    lang = normalize_response_language(response_language)
+    if lang == "auto":
+        return ""
+    return _LANGUAGE_PREFERENCE_PROMPTS.get(lang, "")
+
+
+def build_naonao_platform_hint(response_language: str = RESPONSE_LANGUAGE_DEFAULT) -> str:
+    """Capability hint plus optional soft language preference for register_platform."""
+    pref = language_preference_instruction(response_language)
+    if not pref:
+        return NAONAO_CAPABILITY_HINT
+    return f"{NAONAO_CAPABILITY_HINT} {pref}"
+
+
+def _read_platforms_naonao_response_language() -> Any:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        block = (cfg.get("platforms") or {}).get("naonao")
+        if not isinstance(block, dict):
+            return None
+        if "response_language" in block:
+            return block.get("response_language")
+        extra = block.get("extra")
+        if isinstance(extra, dict) and "response_language" in extra:
+            return extra.get("response_language")
+    except Exception:
+        logger.debug("[naonao] platforms.naonao response_language read skipped", exc_info=True)
+    return None
+
+
+def _read_plugin_settings_response_language() -> Any:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        plugins = cfg.get("plugins") if isinstance(cfg.get("plugins"), dict) else {}
+        entries = plugins.get("entries") if isinstance(plugins.get("entries"), dict) else {}
+        # Install id is usually "naonao"; symlink path installs may use "platforms/naonao".
+        for plugin_id in ("naonao", "platforms/naonao"):
+            entry = entries.get(plugin_id)
+            if not isinstance(entry, dict):
+                continue
+            settings = entry.get("settings")
+            if not isinstance(settings, dict):
+                settings = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+            if isinstance(settings, dict) and "response_language" in settings:
+                return settings.get("response_language")
+    except Exception:
+        logger.debug("[naonao] plugin settings response_language read skipped", exc_info=True)
+    return None
+
+
+def resolve_naonao_response_language(
+    *,
+    config: Any = None,
+    plugin_get_config: Any = None,
+) -> str:
+    """Resolve preference: platforms.naonao → plugin settings → default zh-CN."""
+    platform_raw = None
+    if config is not None:
+        extra = getattr(config, "extra", None) or {}
+        if isinstance(extra, dict) and "response_language" in extra:
+            platform_raw = extra.get("response_language")
+    if platform_raw is None or str(platform_raw).strip() == "":
+        platform_raw = _read_platforms_naonao_response_language()
+
+    plugin_raw = None
+    if callable(plugin_get_config):
+        try:
+            plugin_raw = plugin_get_config("response_language", None)
+        except Exception:
+            plugin_raw = None
+    if plugin_raw is None or str(plugin_raw).strip() == "":
+        plugin_raw = _read_plugin_settings_response_language()
+
+    for raw in (platform_raw, plugin_raw):
+        if raw is None or str(raw).strip() == "":
+            continue
+        return normalize_response_language(raw)
+    return RESPONSE_LANGUAGE_DEFAULT
+
 
 def map_tool_to_activity_category(tool_name: str) -> str:
     """Map a Hermes tool name to a Public Bot API activity category.
@@ -174,6 +308,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
         if isinstance(config.extra, dict):
             config.extra["group_sessions_per_user"] = False
         extra = config.extra or {}
+        self._response_language = resolve_naonao_response_language(config=config)
         self._bot_token = str(_extra_or_secret(extra, "bot_token", "NAONAO_BOT_TOKEN") or "").strip()
         self._api_base = normalize_api_base(str(_extra_or_secret(extra, "api_base", "NAONAO_API_BASE", DEFAULT_API_BASE)))
         self._http_factory = http_factory
@@ -991,6 +1126,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             and reply_author_id
             and str(reply_author_id) == str(self._bot_id)
         )
+        lang_prompt = language_preference_instruction(self._response_language)
         return MessageEvent(
             text=strip_leading_mention(content, self._bot_name),
             message_type=MessageType.TEXT,
@@ -1004,6 +1140,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_author_id if reply_id else None,
             reply_to_author_name=reply_author_name if reply_id else None,
             reply_to_is_own_message=reply_to_is_own,
+            channel_prompt=lang_prompt or None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1050,6 +1187,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             message_id=invocation_id or None,
             scope_id=community_id,
         )
+        lang_prompt = language_preference_instruction(self._response_language)
         return MessageEvent(
             text=f"/{name}",
             message_type=MessageType.TEXT,
@@ -1058,6 +1196,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             source=source,
             message_id=invocation_id or None,
             timestamp=timestamp,
+            channel_prompt=lang_prompt or None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1651,6 +1790,9 @@ def _install_naonao_display_defaults() -> None:
 
 def register(ctx) -> None:
     _install_naonao_display_defaults()
+    response_language = resolve_naonao_response_language(
+        plugin_get_config=getattr(ctx, "get_config", None)
+    )
     ctx.register_platform(
         name="naonao",
         label="NaoNao",
@@ -1669,9 +1811,5 @@ def register(ctx) -> None:
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="💬",
         pii_safe=True,
-        platform_hint=(
-            "You are replying in a NaoNao community channel. "
-            "Send plain text. Files, images, and voice are not available on this adapter. "
-            "The triggering message may still contain an @mention."
-        ),
+        platform_hint=build_naonao_platform_hint(response_language),
     )
