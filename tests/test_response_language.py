@@ -1,4 +1,4 @@
-"""Tests for NaoNao soft response_language preference.
+"""Tests: response_language is deprecated and must not inject language policy.
 
 Run from this plugin directory with Hermes on PYTHONPATH:
 
@@ -39,7 +39,6 @@ _UNSET = adapter_mod._RESPONSE_LANGUAGE_UNSET
 
 
 def _ensure_naonao_platform_registered():
-    """Platform('naonao') is dynamic; register once so NaoNaoAdapter can construct."""
     if platform_registry.get("naonao") is not None:
         return
 
@@ -90,245 +89,91 @@ def _load_plugin_yaml():
     try:
         import yaml
     except ImportError:
-        from utils import fast_safe_load  # Hermes ships a YAML helper
+        from utils import fast_safe_load
 
         return fast_safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
     return yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
 
 
-class ResponseLanguageHelpersTest(unittest.TestCase):
-    def test_default_and_missing(self):
-        self.assertEqual(adapter_mod.normalize_response_language(None), "zh-CN")
-        self.assertEqual(adapter_mod.normalize_response_language(""), "zh-CN")
-        self.assertEqual(adapter_mod.normalize_response_language("   "), "zh-CN")
-
-    def test_canonical_values(self):
+class ResponseLanguageDeprecatedTest(unittest.TestCase):
+    def test_normalize_compat_still_accepts_legacy_values(self):
         self.assertEqual(adapter_mod.normalize_response_language("zh-CN"), "zh-CN")
         self.assertEqual(adapter_mod.normalize_response_language("en"), "en")
         self.assertEqual(adapter_mod.normalize_response_language("auto"), "auto")
+        self.assertEqual(adapter_mod.normalize_response_language("nope"), "zh-CN")
 
-    def test_case_normalization(self):
-        self.assertEqual(adapter_mod.normalize_response_language("zh-cn"), "zh-CN")
-        self.assertEqual(adapter_mod.normalize_response_language("ZH-CN"), "zh-CN")
-        self.assertEqual(adapter_mod.normalize_response_language("EN"), "en")
-        self.assertEqual(adapter_mod.normalize_response_language("Auto"), "auto")
+    def test_language_instruction_always_empty(self):
+        for lang in ("zh-CN", "en", "auto", "", None):
+            self.assertEqual(adapter_mod.language_preference_instruction(lang), "")
 
-    def test_invalid_falls_back_zh_cn(self):
-        self.assertEqual(adapter_mod.normalize_response_language("abc"), "zh-CN")
-        self.assertEqual(adapter_mod.normalize_response_language(123), "zh-CN")
-
-    def test_zh_cn_prompt_soft_preference(self):
-        text = adapter_mod.language_preference_instruction("zh-CN")
-        self.assertIn("Simplified Chinese", text)
-        self.assertIn("default response language", text)
-        self.assertIn("regardless of the language of the user's message", text)
-        self.assertIn("explicitly requests a different language", text)
-        self.assertIn("follow that explicit request", text)
-        self.assertNotIn("Always", text)
-        self.assertNotIn("Never", text)
-        self.assertNotIn("Prefer Simplified Chinese", text)
-
-    def test_en_prompt_soft_preference(self):
-        text = adapter_mod.language_preference_instruction("en")
-        self.assertIn("Use English as the default response language", text)
-        self.assertIn("regardless of the language of the user's message", text)
-        self.assertIn("explicitly requests a different language", text)
-        self.assertIn("follow that explicit request", text)
-        self.assertNotIn("Always", text)
-        self.assertNotIn("Never", text)
-        self.assertNotIn("Prefer English", text)
-
-    def test_auto_has_no_fixed_preference(self):
-        self.assertEqual(adapter_mod.language_preference_instruction("auto"), "")
-        hint = adapter_mod.build_naonao_platform_hint("auto")
-        self.assertEqual(hint, adapter_mod.NAONAO_CAPABILITY_HINT)
-        self.assertNotIn("Simplified Chinese", hint)
-        self.assertNotIn("Use English as the default", hint)
-        self.assertNotIn("default response language", hint)
-
-    def test_platform_hint_and_channel_prompt_share_same_instruction(self):
-        for lang in ("zh-CN", "en"):
-            instruction = adapter_mod.language_preference_instruction(lang)
+    def test_platform_hint_has_no_language_policy(self):
+        for lang in ("zh-CN", "en", "auto"):
             hint = adapter_mod.build_naonao_platform_hint(lang)
-            self.assertTrue(hint.endswith(instruction))
-            self.assertIn(instruction, hint)
+            self.assertEqual(hint, adapter_mod.NAONAO_CAPABILITY_HINT)
+            self.assertNotIn("default response language", hint)
+            self.assertNotIn("Simplified Chinese", hint)
+            self.assertNotIn("Use English", hint)
+            self.assertNotIn("regardless of the language", hint)
 
-    def test_platform_hint_includes_zh_cn_by_default(self):
-        hint = adapter_mod.build_naonao_platform_hint("zh-CN")
-        self.assertIn("NaoNao community channel", hint)
-        self.assertIn("Simplified Chinese", hint)
-        self.assertIn("regardless of the language of the user's message", hint)
-        self.assertIn("explicitly requests a different language", hint)
-
-
-class ResponseLanguageSchemaTest(unittest.TestCase):
-    def test_config_schema_label_choices_default(self):
+    def test_schema_keeps_response_language_for_compat(self):
         data = _load_plugin_yaml()
+        self.assertEqual(str(data.get("version")), "1.3.4")
         schema = (data.get("config_schema") or {}).get("response_language") or {}
-        self.assertEqual(schema.get("label"), "Response Language / 回复语言")
-        self.assertEqual(schema.get("default"), "zh-CN")
-        self.assertEqual(list(schema.get("choices") or []), ["auto", "zh-CN", "en"])
         self.assertEqual(schema.get("type"), "str")
+        self.assertEqual(list(schema.get("choices") or []), ["auto", "zh-CN", "en"])
+        desc = str(schema.get("description") or "").lower()
+        self.assertIn("deprecated", desc)
+        self.assertIn("ignored", desc)
 
-
-class ResponseLanguagePriorityTest(unittest.TestCase):
-    def test_case1_no_settings_no_platform_is_zh_cn(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            self.assertEqual(adapter_mod.resolve_naonao_response_language(), "zh-CN")
-
-    def test_case2_platform_en_only(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            self.assertEqual(adapter_mod.resolve_naonao_response_language(), "en")
-
-    def test_case3_plugin_zh_cn_wins_over_platform_en(self):
+    def test_old_config_does_not_break_resolve(self):
         with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
              unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="zh-CN"):
             self.assertEqual(adapter_mod.resolve_naonao_response_language(), "zh-CN")
 
-    def test_case4_plugin_en_wins_over_platform_zh_cn(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="zh-CN"), \
+    def test_zh_cn_user_message_forwarded_unchanged_without_language_prompt(self):
+        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
+             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="zh-CN"):
+            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={"response_language": "zh-CN"}))
+        ad._bot_id = "bot_1"
+        ad._bot_name = "bot"
+        event = ad.build_mention_event(_mention("@bot 你好，你能做什么？"), 1)
+        self.assertIsNotNone(event)
+        self.assertIn("你好", event.text)
+        self.assertIsNone(event.channel_prompt)
+        self.assertNotIn("Simplified Chinese", event.text)
+        self.assertNotIn("default response language", event.text or "")
+
+    def test_english_user_message_forwarded_unchanged_without_language_prompt(self):
+        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
              unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="en"):
-            self.assertEqual(adapter_mod.resolve_naonao_response_language(), "en")
+            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={"response_language": "en"}))
+        ad._bot_id = "bot_1"
+        ad._bot_name = "bot"
+        event = ad.build_mention_event(_mention("@bot What can you do?"), 1)
+        self.assertIsNotNone(event)
+        self.assertIn("What can you do?", event.text)
+        self.assertIsNone(event.channel_prompt)
+        self.assertNotIn("Use English as the default response language", event.channel_prompt or "")
 
-    def test_case5_plugin_auto_wins_over_platform_en(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="auto"):
-            self.assertEqual(adapter_mod.resolve_naonao_response_language(), "auto")
+    def test_register_platform_hint_has_no_language_injection(self):
+        captured = {}
 
-    def test_case6_invalid_explicit_plugin_does_not_fall_through_to_platform(self):
-        """Explicit but invalid plugin setting → normalize to zh-CN, ignore platform en."""
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="nope"):
-            self.assertEqual(adapter_mod.resolve_naonao_response_language(), "zh-CN")
-
-    def test_schema_default_is_not_explicit_when_get_config_returns_caller_default(self):
-        """Hermes get_config(key, default) returns caller default when absent — not schema default."""
-
-        class _Ctx:
-            def get_config(self, key, default=None):
-                # Simulate absent key: return whatever default the resolver passed.
-                return default
-
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            lang = adapter_mod.resolve_naonao_response_language(plugin_get_config=_Ctx().get_config)
-        self.assertEqual(lang, "en")
-
-    def test_get_config_explicit_zh_cn_wins_over_platform_en(self):
         class _Ctx:
             def get_config(self, key, default=None):
                 if key == "response_language":
                     return "zh-CN"
                 return default
 
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            lang = adapter_mod.resolve_naonao_response_language(plugin_get_config=_Ctx().get_config)
-        self.assertEqual(lang, "zh-CN")
-
-    def test_adapter_extra_platform_en_overridden_by_explicit_plugin_settings(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value="en"), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="zh-CN"):
-            ad = adapter_mod.NaoNaoAdapter(
-                PlatformConfig(enabled=True, extra={"response_language": "en"})
-            )
-        self.assertEqual(ad._response_language, "zh-CN")
-
-
-class ResponseLanguageRuntimeTest(unittest.TestCase):
-    def test_adapter_default_missing_extra_is_zh_cn(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={}))
-        self.assertEqual(ad._response_language, "zh-CN")
-        event = ad.build_mention_event(_mention(), 1)
-        self.assertIsNotNone(event)
-        self.assertIn("Use Simplified Chinese", event.channel_prompt or "")
-        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
-
-    def test_adapter_en_from_extra(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={"response_language": "en"}))
-        self.assertEqual(ad._response_language, "en")
-        event = ad.build_mention_event(_mention(), 1)
-        self.assertIn("Use English as the default response language", event.channel_prompt or "")
-        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
-        self.assertNotIn("Simplified Chinese", event.channel_prompt or "")
-
-    def test_adapter_auto_clears_channel_prompt(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={"response_language": "auto"}))
-        event = ad.build_mention_event(_mention(), 1)
-        self.assertIsNone(event.channel_prompt)
-
-    def test_register_platform_hint_default_zh_cn(self):
-        class _Ctx:
-            def __init__(self):
-                self.kwargs = {}
-
-            def get_config(self, key, default=None):
-                return default
-
             def register_platform(self, **kwargs):
-                self.kwargs = kwargs
+                captured.update(kwargs)
 
-        ctx = _Ctx()
         with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET), \
+             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value="zh-CN"), \
              unittest.mock.patch.object(adapter_mod, "_install_naonao_display_defaults"):
-            adapter_mod.register(ctx)
-        hint = ctx.kwargs.get("platform_hint") or ""
-        self.assertIn("Use Simplified Chinese", hint)
-        self.assertIn("regardless of the language of the user's message", hint)
-        self.assertIn("NaoNao community channel", hint)
-        self.assertEqual(ctx.kwargs.get("name"), "naonao")
-
-    def test_register_auto_omits_language_lock(self):
-        class _Ctx:
-            def __init__(self):
-                self.kwargs = {}
-
-            def get_config(self, key, default=None):
-                return "auto" if key == "response_language" else default
-
-            def register_platform(self, **kwargs):
-                self.kwargs = kwargs
-
-        ctx = _Ctx()
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET), \
-             unittest.mock.patch.object(adapter_mod, "_install_naonao_display_defaults"):
-            adapter_mod.register(ctx)
-        hint = ctx.kwargs.get("platform_hint") or ""
-        self.assertNotIn("Simplified Chinese", hint)
-        self.assertNotIn("Use English as the default", hint)
+            adapter_mod.register(_Ctx())
+        hint = captured.get("platform_hint") or ""
+        self.assertEqual(hint, adapter_mod.NAONAO_CAPABILITY_HINT)
         self.assertNotIn("default response language", hint)
-
-    def test_reply_mapping_unchanged_with_language_prompt(self):
-        with unittest.mock.patch.object(adapter_mod, "_read_platforms_naonao_response_language", return_value=None), \
-             unittest.mock.patch.object(adapter_mod, "_read_plugin_settings_response_language", return_value=_UNSET):
-            ad = adapter_mod.NaoNaoAdapter(PlatformConfig(enabled=True, extra={}))
-        payload = _mention()
-        payload["message"]["replyToMessageId"] = "parent_1"
-        payload["message"]["reply"] = {
-            "messageId": "parent_1",
-            "excerpt": "你好！我是你的专属助手",
-            "authorId": "bot_1",
-            "authorName": "my bot",
-            "authorType": "bot",
-        }
-        ad._bot_id = "bot_1"
-        event = ad.build_mention_event(payload, 1)
-        self.assertEqual(event.reply_to_message_id, "parent_1")
-        self.assertIn("专属助手", event.reply_to_text or "")
-        self.assertTrue(event.reply_to_is_own_message)
-        self.assertNotIn("reply", event.metadata)
-        self.assertIn("Use Simplified Chinese", event.channel_prompt or "")
-        self.assertIn("regardless of the language of the user's message", event.channel_prompt or "")
 
 
 if __name__ == "__main__":

@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.3.3**
+**Plugin version: 1.3.4**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.3**.
+Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.4**.
 
 ## What it does
 
@@ -140,46 +140,18 @@ platforms:
 
 ## Response language
 
-NaoNao defaults to Simplified Chinese replies. This is a **soft model preference** injected before the agent generates a response — not a hard language lock, and not a second translation pass. Explicit user requests for another language may override it, and instruction-following strength can vary by model (models that follow system instructions more reliably usually stick closer to the preference).
+The NaoNao plugin does **not** force the agent reply language.
 
-Supported values:
+Hermes (and the underlying model) chooses the response language from the user's message and conversation context. For example, a Chinese question usually gets a Chinese reply; an English question usually gets an English reply — without Plugin-injected “reply in Chinese/English” instructions.
 
-| Value | Behavior |
-|---|---|
-| `zh-CN` | Default preference: Simplified Chinese (default) |
-| `en` | Default preference: English |
-| `auto` | No fixed default reply language; follow the conversation / model |
+### Deprecated setting (ignored)
 
-### Recommended (ordinary users)
+Older installs may still have:
 
-In Hermes Desktop:
+- `plugins.entries.naonao.settings.response_language` (`zh-CN` / `en` / `auto`)
+- or legacy `platforms.naonao.response_language`
 
-**Settings → Plugins → NaoNao → Response Language / 回复语言**
-
-Choose `zh-CN`, `en`, or `auto`, Save, then restart the gateway.
-
-This writes `plugins.entries.naonao.settings.response_language` in `~/.hermes/config.yaml`. You do not need to edit YAML by hand.
-
-### Legacy / manual compatibility
-
-Advanced or older setups may still use:
-
-```yaml
-platforms:
-  naonao:
-    enabled: true
-    response_language: zh-CN
-```
-
-Resolution order:
-
-1. Explicit Plugin Settings (`plugins.entries.naonao.settings.response_language`) — if the key is actually stored
-2. Legacy platform config (`platforms.naonao.response_language`)
-3. Default `zh-CN`
-
-Schema `default: zh-CN` is only a Desktop form fallback until you Save; it does not count as an explicit Plugin Setting. When Plugin Settings contain an explicit value, that value wins over any leftover `platforms.naonao.response_language`.
-
-Invalid or empty values fall back to `zh-CN`. Restart the gateway after changing this setting.
+Those values remain valid for config compatibility and do not break gateway startup, but they are **ignored at runtime** since v1.3.4. You can leave them as-is or remove them later.
 
 ## Version highlights
 
@@ -191,8 +163,9 @@ Invalid or empty values fall back to `zh-CN`. Restart the gateway after changing
 | v1.3.1 | Tool status via Activity only; 👀 removed after final delivery |
 | v1.3.2 | Structured reply context mapped to Hermes `reply_to_*` fields |
 | v1.3.3 | Configurable soft response language preference (`zh-CN` / `en` / `auto`) |
+| v1.3.4 | Stop injecting response-language instructions; Hermes follows conversation |
 
-Recommended: **v1.3.3**.
+Recommended: **v1.3.4**.
 
 ## Upgrade
 
@@ -398,14 +371,12 @@ Hermes streaming (config.yaml, not env):
 |---|---|---|
 | `streaming.enabled` | yes | `false` |
 
-NaoNao response language (config.yaml, not env):
+NaoNao `response_language` (deprecated, ignored at runtime; config.yaml only):
 
-| Key | Required | Default | Values |
-|---|---|---|---|
-| `plugins.entries.naonao.settings.response_language` | no | `zh-CN` (when unset) | `auto`, `zh-CN`, `en` |
-| `platforms.naonao.response_language` | no | — (legacy) | `auto`, `zh-CN`, `en` |
-
-Preferred UX: Hermes Desktop **Settings → Plugins → NaoNao → Response Language / 回复语言**. Explicit Plugin Settings override legacy `platforms.naonao.response_language`.
+| Key | Required | Notes |
+|---|---|---|
+| `plugins.entries.naonao.settings.response_language` | no | Legacy values `auto` / `zh-CN` / `en` remain valid for config compatibility |
+| `platforms.naonao.response_language` | no | Legacy platform key; also ignored at runtime |
 
 Recommended path for other keys: `hermes config set`. Alternative: edit `~/.hermes/.env` / `config.yaml` directly. Do not commit either file.
 

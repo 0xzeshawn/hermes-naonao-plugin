@@ -84,12 +84,10 @@ _TOOL_ACTIVITY_CATEGORY: Dict[str, str] = {
 }
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 
-# Soft response-language preference (not a hard lock). Resolution order:
-#   1. explicit plugins.entries.naonao.settings.response_language (Desktop / config_schema)
-#   2. legacy platforms.naonao.response_language (PlatformConfig.extra / YAML)
-#   3. default zh-CN
-# Schema default is UI-only until the user Saves; it is never treated as an
-# explicit plugin setting (Hermes get_config does not inject config_schema.default).
+# response_language (DEPRECATED — ignored at runtime since v1.3.4).
+# Kept only so existing Desktop/YAML settings (zh-CN|en|auto) do not break
+# config load. Hermes / the model chooses reply language from the user message
+# and conversation context. This adapter must not inject language instructions.
 RESPONSE_LANGUAGE_DEFAULT = "zh-CN"
 RESPONSE_LANGUAGE_VALUES = frozenset({"auto", "zh-CN", "en"})
 # Sentinel: plugin-settings key absent (distinct from explicit null/empty).
@@ -99,25 +97,14 @@ NAONAO_CAPABILITY_HINT = (
     "Send plain text. Files, images, and voice are not available on this adapter. "
     "The triggering message may still contain an @mention."
 )
-# Soft default-response-language instruction (shared by platform_hint + channel_prompt).
-# Stronger than "Prefer …" so ordinary other-language user messages still follow the
-# configured default, while explicit user language requests remain higher priority.
-_LANGUAGE_PREFERENCE_PROMPTS = {
-    "zh-CN": (
-        "Use Simplified Chinese (简体中文) as the default response language, "
-        "regardless of the language of the user's message. "
-        "If the user explicitly requests a different language, follow that explicit request for that response."
-    ),
-    "en": (
-        "Use English as the default response language, "
-        "regardless of the language of the user's message. "
-        "If the user explicitly requests a different language, follow that explicit request for that response."
-    ),
-}
 
 
 def normalize_response_language(raw: Any) -> str:
-    """Map a configured value to auto|zh-CN|en. Invalid/empty → default zh-CN."""
+    """Normalize a legacy configured value to auto|zh-CN|en (compat only).
+
+    Invalid/empty → default zh-CN. Runtime no longer injects language prompts
+    from this value.
+    """
     if raw is None:
         return RESPONSE_LANGUAGE_DEFAULT
     text = str(raw).strip().replace("_", "-")
@@ -130,35 +117,32 @@ def normalize_response_language(raw: Any) -> str:
         return "en"
     if key in ("zh-cn", "zh", "zh-hans"):
         return "zh-CN"
-    # Case variants of the canonical tokens already covered by lowercasing above.
     if text in RESPONSE_LANGUAGE_VALUES:
         return text
-    logger.warning(
-        "[naonao] invalid response_language=%r; falling back to %s",
+    logger.debug(
+        "[naonao] ignoring invalid deprecated response_language=%r (compat normalize → %s)",
         raw,
         RESPONSE_LANGUAGE_DEFAULT,
     )
     return RESPONSE_LANGUAGE_DEFAULT
 
 
-def language_preference_instruction(response_language: str) -> str:
-    """Soft default-response-language instruction for platform_hint and channel_prompt.
+def language_preference_instruction(response_language: str = "") -> str:
+    """Always empty: NaoNao Plugin does not force agent response language.
 
-    auto → empty (no fixed language instruction). Not a hard lock: explicit user
-    language requests override the configured default.
+    ``response_language`` is accepted for call-site compatibility and ignored.
     """
-    lang = normalize_response_language(response_language)
-    if lang == "auto":
-        return ""
-    return _LANGUAGE_PREFERENCE_PROMPTS.get(lang, "")
+    del response_language
+    return ""
 
 
 def build_naonao_platform_hint(response_language: str = RESPONSE_LANGUAGE_DEFAULT) -> str:
-    """Capability hint plus the same language instruction used for channel_prompt."""
-    pref = language_preference_instruction(response_language)
-    if not pref:
-        return NAONAO_CAPABILITY_HINT
-    return f"{NAONAO_CAPABILITY_HINT} {pref}"
+    """Capability-only platform hint (no language policy).
+
+    ``response_language`` is accepted for call-site compatibility and ignored.
+    """
+    del response_language
+    return NAONAO_CAPABILITY_HINT
 
 
 def _read_platforms_naonao_response_language() -> Any:
@@ -1158,7 +1142,6 @@ class NaoNaoAdapter(BasePlatformAdapter):
             and reply_author_id
             and str(reply_author_id) == str(self._bot_id)
         )
-        lang_prompt = language_preference_instruction(self._response_language)
         return MessageEvent(
             text=strip_leading_mention(content, self._bot_name),
             message_type=MessageType.TEXT,
@@ -1172,7 +1155,8 @@ class NaoNaoAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_author_id if reply_id else None,
             reply_to_author_name=reply_author_name if reply_id else None,
             reply_to_is_own_message=reply_to_is_own,
-            channel_prompt=lang_prompt or None,
+            # Do not inject response-language policy; Hermes follows conversation.
+            channel_prompt=None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1219,7 +1203,6 @@ class NaoNaoAdapter(BasePlatformAdapter):
             message_id=invocation_id or None,
             scope_id=community_id,
         )
-        lang_prompt = language_preference_instruction(self._response_language)
         return MessageEvent(
             text=f"/{name}",
             message_type=MessageType.TEXT,
@@ -1228,7 +1211,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             source=source,
             message_id=invocation_id or None,
             timestamp=timestamp,
-            channel_prompt=lang_prompt or None,
+            channel_prompt=None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1822,7 +1805,8 @@ def _install_naonao_display_defaults() -> None:
 
 def register(ctx) -> None:
     _install_naonao_display_defaults()
-    response_language = resolve_naonao_response_language(
+    # Resolve legacy response_language for compat logging only — never inject.
+    _ = resolve_naonao_response_language(
         plugin_get_config=getattr(ctx, "get_config", None)
     )
     ctx.register_platform(
@@ -1843,5 +1827,5 @@ def register(ctx) -> None:
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="💬",
         pii_safe=True,
-        platform_hint=build_naonao_platform_hint(response_language),
+        platform_hint=build_naonao_platform_hint(),
     )
