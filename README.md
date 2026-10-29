@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.3.2**
+**Plugin version: 1.3.4**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.2**.
+Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.4**.
 
 ## What it does
 
@@ -138,6 +138,21 @@ platforms:
     enabled: true
 ```
 
+## Response language
+
+The NaoNao plugin does **not** force the agent reply language.
+
+Hermes (and the underlying model) chooses the response language from the user's message and conversation context. For example, a Chinese question usually gets a Chinese reply; an English question usually gets an English reply — without Plugin-injected “reply in Chinese/English” instructions.
+
+### Deprecated setting (ignored)
+
+Older installs may still have:
+
+- `plugins.entries.naonao.settings.response_language` (`zh-CN` / `en` / `auto`)
+- or legacy `platforms.naonao.response_language`
+
+Those values remain valid for config compatibility and do not break gateway startup, but they are **ignored at runtime** since v1.3.4. You can leave them as-is or remove them later.
+
 ## Version highlights
 
 | Version | Highlights |
@@ -147,8 +162,10 @@ platforms:
 | v1.3.0 | Safe Agent / Tool Activity categories |
 | v1.3.1 | Tool status via Activity only; 👀 removed after final delivery |
 | v1.3.2 | Structured reply context mapped to Hermes `reply_to_*` fields |
+| v1.3.3 | Configurable soft response language preference (`zh-CN` / `en` / `auto`) |
+| v1.3.4 | Stop injecting response-language instructions; Hermes follows conversation |
 
-Recommended: **v1.3.2**.
+Recommended: **v1.3.4**.
 
 ## Upgrade
 
@@ -354,7 +371,14 @@ Hermes streaming (config.yaml, not env):
 |---|---|---|
 | `streaming.enabled` | yes | `false` |
 
-Recommended path: `hermes config set` for every value you do set. Alternative: edit `~/.hermes/.env` / `config.yaml` directly. Do not commit either file.
+NaoNao `response_language` (deprecated, ignored at runtime; config.yaml only):
+
+| Key | Required | Notes |
+|---|---|---|
+| `plugins.entries.naonao.settings.response_language` | no | Legacy values `auto` / `zh-CN` / `en` remain valid for config compatibility |
+| `platforms.naonao.response_language` | no | Legacy platform key; also ignored at runtime |
+
+Recommended path for other keys: `hermes config set`. Alternative: edit `~/.hermes/.env` / `config.yaml` directly. Do not commit either file.
 
 ## Integration contract
 

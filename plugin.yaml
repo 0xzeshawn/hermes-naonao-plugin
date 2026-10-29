@@ -1,7 +1,8 @@
 name: naonao
 label: NaoNao
 kind: platform
-version: 1.3.2
+version: 1.3.4
+manifest_version: 2
 description: >
   NaoNao messaging platform adapter for Hermes Agent.
   Connects with a NaoNao Bot Token, receives message.bot_mention and
@@ -39,3 +40,16 @@ optional_env:
     description: "Set true to admit every NaoNao sender with a stable actor id"
     prompt: "Allow all NaoNao users (true/false)"
     password: false
+# Desktop Plugins settings form. response_language is DEPRECATED and ignored at
+# runtime (kept so existing plugins.entries.naonao.settings / platforms.naonao
+# values do not break config check or gateway startup).
+config_schema:
+  response_language:
+    type: str
+    label: "Response Language / 回复语言 (deprecated)"
+    choices: [auto, zh-CN, en]
+    default: auto
+    description: >
+      Deprecated and ignored. Hermes chooses the reply language from the user's
+      message and conversation context. Existing zh-CN / en / auto values remain
+      valid for config compatibility but no longer change agent behavior.

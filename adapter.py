@@ -84,6 +84,156 @@ _TOOL_ACTIVITY_CATEGORY: Dict[str, str] = {
 }
 _SECRET_RE = re.compile(r"nn_(?:bot|bgs|gwr)_[A-Za-z0-9_-]+")
 
+# response_language (DEPRECATED — ignored at runtime since v1.3.4).
+# Kept only so existing Desktop/YAML settings (zh-CN|en|auto) do not break
+# config load. Hermes / the model chooses reply language from the user message
+# and conversation context. This adapter must not inject language instructions.
+RESPONSE_LANGUAGE_DEFAULT = "zh-CN"
+RESPONSE_LANGUAGE_VALUES = frozenset({"auto", "zh-CN", "en"})
+# Sentinel: plugin-settings key absent (distinct from explicit null/empty).
+_RESPONSE_LANGUAGE_UNSET = object()
+NAONAO_CAPABILITY_HINT = (
+    "You are replying in a NaoNao community channel. "
+    "Send plain text. Files, images, and voice are not available on this adapter. "
+    "The triggering message may still contain an @mention."
+)
+
+
+def normalize_response_language(raw: Any) -> str:
+    """Normalize a legacy configured value to auto|zh-CN|en (compat only).
+
+    Invalid/empty → default zh-CN. Runtime no longer injects language prompts
+    from this value.
+    """
+    if raw is None:
+        return RESPONSE_LANGUAGE_DEFAULT
+    text = str(raw).strip().replace("_", "-")
+    if not text:
+        return RESPONSE_LANGUAGE_DEFAULT
+    key = text.lower()
+    if key == "auto":
+        return "auto"
+    if key in ("en", "en-us", "en-gb"):
+        return "en"
+    if key in ("zh-cn", "zh", "zh-hans"):
+        return "zh-CN"
+    if text in RESPONSE_LANGUAGE_VALUES:
+        return text
+    logger.debug(
+        "[naonao] ignoring invalid deprecated response_language=%r (compat normalize → %s)",
+        raw,
+        RESPONSE_LANGUAGE_DEFAULT,
+    )
+    return RESPONSE_LANGUAGE_DEFAULT
+
+
+def language_preference_instruction(response_language: str = "") -> str:
+    """Always empty: NaoNao Plugin does not force agent response language.
+
+    ``response_language`` is accepted for call-site compatibility and ignored.
+    """
+    del response_language
+    return ""
+
+
+def build_naonao_platform_hint(response_language: str = RESPONSE_LANGUAGE_DEFAULT) -> str:
+    """Capability-only platform hint (no language policy).
+
+    ``response_language`` is accepted for call-site compatibility and ignored.
+    """
+    del response_language
+    return NAONAO_CAPABILITY_HINT
+
+
+def _read_platforms_naonao_response_language() -> Any:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        block = (cfg.get("platforms") or {}).get("naonao")
+        if not isinstance(block, dict):
+            return None
+        if "response_language" in block:
+            return block.get("response_language")
+        extra = block.get("extra")
+        if isinstance(extra, dict) and "response_language" in extra:
+            return extra.get("response_language")
+    except Exception:
+        logger.debug("[naonao] platforms.naonao response_language read skipped", exc_info=True)
+    return None
+
+
+def _read_plugin_settings_response_language() -> Any:
+    """Return the stored plugin setting if the key exists; else ``_RESPONSE_LANGUAGE_UNSET``.
+
+    Key presence is required — schema default alone does not count as explicit.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        plugins = cfg.get("plugins") if isinstance(cfg.get("plugins"), dict) else {}
+        entries = plugins.get("entries") if isinstance(plugins.get("entries"), dict) else {}
+        # Install id is usually "naonao"; symlink path installs may use "platforms/naonao".
+        for plugin_id in ("naonao", "platforms/naonao"):
+            entry = entries.get(plugin_id)
+            if not isinstance(entry, dict):
+                continue
+            settings = entry.get("settings")
+            if not isinstance(settings, dict):
+                settings = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+            if isinstance(settings, dict) and "response_language" in settings:
+                return settings.get("response_language")
+    except Exception:
+        logger.debug("[naonao] plugin settings response_language read skipped", exc_info=True)
+    return _RESPONSE_LANGUAGE_UNSET
+
+
+def _explicit_plugin_response_language(*, plugin_get_config: Any = None) -> Any:
+    """Raw plugin setting when the key is stored; else ``_RESPONSE_LANGUAGE_UNSET``.
+
+    Hermes ``ctx.get_config(key, default)`` returns *default* when the key is absent and
+    does not apply ``config_schema.default``. Passing ``_RESPONSE_LANGUAGE_UNSET`` as that
+    default distinguishes absent from an explicit stored value (including ``zh-CN``).
+    """
+    if callable(plugin_get_config):
+        try:
+            value = plugin_get_config("response_language", _RESPONSE_LANGUAGE_UNSET)
+            if value is not _RESPONSE_LANGUAGE_UNSET:
+                return value
+        except Exception:
+            logger.debug("[naonao] plugin get_config response_language skipped", exc_info=True)
+    return _read_plugin_settings_response_language()
+
+
+def resolve_naonao_response_language(
+    *,
+    config: Any = None,
+    plugin_get_config: Any = None,
+) -> str:
+    """Resolve preference: explicit plugin settings → legacy platform → default zh-CN.
+
+    Only a key actually present under ``plugins.entries.*.settings`` (or legacy
+    ``config``) counts as explicit plugin settings. Schema default is not explicit.
+    An explicit but invalid/empty plugin value normalizes to ``zh-CN`` and does not
+    fall through to platform config (the user already chose plugin settings).
+    """
+    plugin_raw = _explicit_plugin_response_language(plugin_get_config=plugin_get_config)
+    if plugin_raw is not _RESPONSE_LANGUAGE_UNSET:
+        return normalize_response_language(plugin_raw)
+
+    platform_raw = None
+    if config is not None:
+        extra = getattr(config, "extra", None) or {}
+        if isinstance(extra, dict) and "response_language" in extra:
+            platform_raw = extra.get("response_language")
+    if platform_raw is None or str(platform_raw).strip() == "":
+        platform_raw = _read_platforms_naonao_response_language()
+
+    if platform_raw is not None and str(platform_raw).strip() != "":
+        return normalize_response_language(platform_raw)
+    return RESPONSE_LANGUAGE_DEFAULT
+
 
 def map_tool_to_activity_category(tool_name: str) -> str:
     """Map a Hermes tool name to a Public Bot API activity category.
@@ -174,6 +324,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
         if isinstance(config.extra, dict):
             config.extra["group_sessions_per_user"] = False
         extra = config.extra or {}
+        self._response_language = resolve_naonao_response_language(config=config)
         self._bot_token = str(_extra_or_secret(extra, "bot_token", "NAONAO_BOT_TOKEN") or "").strip()
         self._api_base = normalize_api_base(str(_extra_or_secret(extra, "api_base", "NAONAO_API_BASE", DEFAULT_API_BASE)))
         self._http_factory = http_factory
@@ -1004,6 +1155,8 @@ class NaoNaoAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_author_id if reply_id else None,
             reply_to_author_name=reply_author_name if reply_id else None,
             reply_to_is_own_message=reply_to_is_own,
+            # Do not inject response-language policy; Hermes follows conversation.
+            channel_prompt=None,
         )
 
     def build_command_event(self, payload: Dict[str, Any], sequence: Any) -> Optional[MessageEvent]:
@@ -1051,6 +1204,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
             source=source,
             message_id=invocation_id or None,
             timestamp=timestamp,
+            channel_prompt=None,
         )
 
     async def _connection_loop(self) -> None:
@@ -1637,6 +1791,10 @@ def _install_naonao_display_defaults() -> None:
 
 def register(ctx) -> None:
     _install_naonao_display_defaults()
+    # Resolve legacy response_language for compat logging only — never inject.
+    _ = resolve_naonao_response_language(
+        plugin_get_config=getattr(ctx, "get_config", None)
+    )
     ctx.register_platform(
         name="naonao",
         label="NaoNao",
@@ -1655,9 +1813,5 @@ def register(ctx) -> None:
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="💬",
         pii_safe=True,
-        platform_hint=(
-            "You are replying in a NaoNao community channel. "
-            "Send plain text. Files, images, and voice are not available on this adapter. "
-            "The triggering message may still contain an @mention."
-        ),
+        platform_hint=build_naonao_platform_hint(),
     )
