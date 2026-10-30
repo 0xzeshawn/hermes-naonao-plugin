@@ -493,14 +493,15 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(identify["d"]["token"].startswith("nn_bot_"))
         self.assertEqual(len(adapter._seen), 1)
         event = adapter._seen[0][0]
-        self.assertEqual(event.metadata["naonao_event_id"], "evt_1")
+        self.assertEqual(event.metadata, {})
+        self.assertEqual(adapter._event_for_chat[event.source.chat_id], "evt_1")
         self.assertEqual(event.message_id, "msg_1")
         self.assertIsNone(event.user_id)
         self.assertEqual(event.user_name, "member")
         self.assertEqual(event.text, "你好")
-        reply = await adapter.send(event.source.chat_id, "Hermes reply", metadata={"naonao_event_id": "evt_1"})
+        reply = await adapter.send(event.source.chat_id, "Hermes reply")
         self.assertTrue(reply.success)
-        second = await adapter.send(event.source.chat_id, "Hermes reply again", metadata={"naonao_event_id": "evt_1"})
+        second = await adapter.send(event.source.chat_id, "Hermes reply again")
         self.assertTrue(second.success)
         keys = [call["headers"].get("Idempotency-Key") for call in adapter._http_box.calls if call["url"].endswith("/messages")]
         self.assertEqual(keys, ["evt_1:1", "evt_1:2"])
@@ -627,7 +628,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(adapter.config.extra["group_sessions_per_user"])
         self.assertIn("community_a", first.source.chat_id)
         self.assertIn("community_b", second.source.chat_id)
-        self.assertNotEqual(first.metadata["naonao_event_id"], first.message_id)
+        self.assertEqual(first.metadata, {})
 
     async def test_diagnostic_logs_keep_event_and_ack_behavior(self):
         frames = [
@@ -712,7 +713,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.chat_id, "community_a:channel_x")
         self.assertEqual(event.source.chat_type, "channel")
         self.assertEqual(event.message_id, "inv_1")
-        self.assertEqual(event.metadata["naonao_event_id"], "evt_cmd")
+        self.assertEqual(event.metadata, {})
         self.assertTrue(event.is_command())
         self.assertEqual(event.get_command(), "sethome")
         unnamed = adapter.build_command_event(_command(actor_id="member", username="member", event_id="evt_name"), 12)
@@ -1000,7 +1001,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         adapter._process_message_background = background
         self.assertTrue(await adapter.connect())
         await asyncio.wait_for(self._until(lambda: len(adapter._seen) == 2), 2)
-        self.assertEqual([item[0].metadata["naonao_event_id"] for item in adapter._seen], ["evt_a", "evt_b"])
+        self.assertEqual([item[0].metadata for item in adapter._seen], [{}, {}])
         self.assertEqual([item[0].text for item in adapter._seen], ["你好", "你好"])
         await adapter.disconnect()
 

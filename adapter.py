@@ -1157,13 +1157,6 @@ class NaoNaoAdapter(BasePlatformAdapter):
             reply_to_is_own_message=reply_to_is_own,
             # Do not inject response-language policy; Hermes follows conversation.
             channel_prompt=None,
-            metadata={
-                "naonao_event_id": event_id,
-                "naonao_sequence": sequence,
-                "naonao_raw_content": content,
-                "naonao_community_id": community_id,
-                "naonao_installation_id": str((data.get("installation") or {}).get("id") or ""),
-            },
         )
 
     def build_command_event(self, payload: Dict[str, Any], sequence: Any) -> Optional[MessageEvent]:
@@ -1212,13 +1205,6 @@ class NaoNaoAdapter(BasePlatformAdapter):
             message_id=invocation_id or None,
             timestamp=timestamp,
             channel_prompt=None,
-            metadata={
-                "naonao_event_id": event_id,
-                "naonao_sequence": sequence,
-                "naonao_command_name": name,
-                "naonao_community_id": community_id,
-                "naonao_installation_id": str((data.get("installation") or {}).get("id") or ""),
-            },
         )
 
     async def _connection_loop(self) -> None:
