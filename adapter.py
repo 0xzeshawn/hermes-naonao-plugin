@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import ipaddress
+import socket
 import logging
 import random
 import re
@@ -94,7 +96,11 @@ RESPONSE_LANGUAGE_VALUES = frozenset({"auto", "zh-CN", "en"})
 _RESPONSE_LANGUAGE_UNSET = object()
 NAONAO_CAPABILITY_HINT = (
     "You are replying in a NaoNao community channel. "
-    "Send plain text. Files, images, and voice are not available on this adapter. "
+    "Send plain text; outbound images, files and voice are unsupported. "
+    "Inbound images may be available as cached local media: directly attached to the @mention, "
+    "attached to its replied-to message, or one unambiguous recent same-sender image message "
+    "when the user explicitly asks about an image. Only inspect successfully loaded media. "
+    "Obey per-event image failure/clarification status; never claim to see unavailable images. "
     "The triggering message may still contain an @mention."
 )
 
@@ -303,8 +309,62 @@ def strip_leading_mention(content: str, bot_name: str) -> str:
     return pattern.sub("", text, count=1).strip() or text
 
 
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_IMAGES = 3
+IMAGE_TIMEOUT_SECONDS = 20
+_IMAGE_REFERENCE = re.compile(r"图片|截图|照片|图像|相片|\b(?:image|photo|screenshot|picture)s?\b", re.I)
+_IMAGE_FORMATS = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+
+
+def _image_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    raise ValueError("invalid_image_magic")
+
+
+def _public_image_ips(host: str, port: int) -> list[str]:
+    # Deliberately stricter than Hermes' configurable private-URL exceptions.
+    answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    ips = list(dict.fromkeys(item[4][0] for item in answers))
+    if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
+        raise ValueError("unsafe_image_destination")
+    return ips
+
+
+async def _validate_image_url(url: str) -> None:
+    parsed = urlparse(url)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.fragment or parsed.port not in (None, 443)):
+        raise ValueError("unsafe_image_url")
+    await asyncio.to_thread(_public_image_ips, parsed.hostname, 443)
+
+
+def _open_image_http():
+    # Connect-time validation and IP dialing close the DNS-rebinding gap. No proxy,
+    # cookies or inherited Bot credentials; private-URL config cannot relax this.
+    from tools.url_safety import create_ssrf_safe_async_client, _SSRFGuardedAsyncNetworkBackend
+
+    class StrictImageBackend(_SSRFGuardedAsyncNetworkBackend):
+        def _connect_ips(self, host, port):
+            return _public_image_ips(host, port)
+
+    client = create_ssrf_safe_async_client(
+        timeout=IMAGE_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False,
+    )
+    pool = client._transport._pool
+    pool._network_backend = StrictImageBackend(pool._network_backend._schemes_by_origin_var)
+    return client
+
+
 class NaoNaoAdapter(BasePlatformAdapter):
-    """Text-only NaoNao Gateway adapter."""
+    """NaoNao text output and authorized image input for Hermes Gateway."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True
@@ -324,6 +384,7 @@ class NaoNaoAdapter(BasePlatformAdapter):
         if isinstance(config.extra, dict):
             config.extra["group_sessions_per_user"] = False
         extra = config.extra or {}
+        # Deprecated (since 1.3.4): resolved for config compatibility only, never injected.
         self._response_language = resolve_naonao_response_language(config=config)
         self._bot_token = str(_extra_or_secret(extra, "bot_token", "NAONAO_BOT_TOKEN") or "").strip()
         self._api_base = normalize_api_base(str(_extra_or_secret(extra, "api_base", "NAONAO_API_BASE", DEFAULT_API_BASE)))
@@ -1126,37 +1187,25 @@ class NaoNaoAdapter(BasePlatformAdapter):
             scope_id=community_id,
         )
         # Hermes MessageEvent first-class reply fields (NOT metadata).
-        # Admission may reject nonempty metadata; reply context must use reply_to_*.
         reply = message.get("reply") if isinstance(message.get("reply"), dict) else {}
-        reply_id = str(message.get("replyToMessageId") or reply.get("messageId") or "").strip() or None
-        reply_excerpt = str(reply.get("excerpt") or reply.get("content") or "").strip()
-        if reply_id and not reply_excerpt and (reply.get("deleted") or reply.get("removed")):
-            reply_excerpt = "(original message unavailable)"
-        reply_author_name = str(reply.get("authorName") or "").strip() or None
-        reply_author_id = str(reply.get("authorId") or "").strip() or None
-        reply_author_type = str(reply.get("authorType") or "user").strip().lower()
-        reply_to_is_own = bool(
-            reply_id
-            and reply_author_type == "bot"
-            and self._bot_id
-            and reply_author_id
-            and str(reply_author_id) == str(self._bot_id)
-        )
+        reply_id = str(message.get("replyToMessageId") or reply.get("messageId") or reply.get("id") or "").strip() or None
+        excerpt = str(reply.get("excerpt") or reply.get("content") or "").strip()
+        if reply_id and not excerpt and (reply.get("deleted") or reply.get("removed")):
+            excerpt = "(original message unavailable)"
         return MessageEvent(
             text=strip_leading_mention(content, self._bot_name),
+            reply_to_message_id=reply_id,
+            reply_to_text=(excerpt or None) if reply_id else None,
+            reply_to_author_id=(str(reply.get("authorId") or "") or None) if reply_id else None,
+            reply_to_author_name=(str(reply.get("authorName") or "") or None) if reply_id else None,
+            reply_to_is_own_message=bool(reply_id and reply.get("authorType") == "bot" and self._bot_id
+                                         and str(reply.get("authorId") or "") == self._bot_id),
             message_type=MessageType.TEXT,
             user_id=user_id,
             user_name=username or None,
             source=source,
             message_id=str(message.get("id") or "") or None,
             timestamp=timestamp,
-            reply_to_message_id=reply_id,
-            reply_to_text=(reply_excerpt or None) if reply_id else None,
-            reply_to_author_id=reply_author_id if reply_id else None,
-            reply_to_author_name=reply_author_name if reply_id else None,
-            reply_to_is_own_message=reply_to_is_own,
-            # Do not inject response-language policy; Hermes follows conversation.
-            channel_prompt=None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1165,6 +1214,194 @@ class NaoNaoAdapter(BasePlatformAdapter):
                 "naonao_installation_id": str((data.get("installation") or {}).get("id") or ""),
             },
         )
+
+    @staticmethod
+    def _image_context(event: MessageEvent, detail: str) -> None:
+        instruction = (
+            "NaoNao image input status: " + detail + ". "
+            "Only successfully cached media attachments are available for vision. "
+            "Do not claim to have seen missing/failed images or infer their contents from URLs. "
+            "If unavailable or ambiguous, explain the limitation and ask the user to attach or reply to the intended image. "
+            "Never bypass channel permissions."
+        )
+        event.channel_prompt = "\n".join(filter(None, [event.channel_prompt, instruction]))
+
+    @staticmethod
+    def _image_attachments(message: dict) -> list[dict]:
+        entries = message.get("attachments")
+        if not isinstance(entries, list):
+            return []
+        return [a for a in entries if isinstance(a, dict) and a.get("kind") == "image"]
+
+    async def _history_image_message(self, event: MessageEvent, channel_id: str) -> dict:
+        body = await self._api("GET", f"/api/v1/channels/{quote(channel_id, safe='')}/messages?limit=10")
+        if body.get("ok") is not True or not isinstance(body.get("messages"), list):
+            raise ValueError("history_unavailable")
+        # 以触发消息而非处理时间为上界，避免 Gateway 延迟时读到提问之后的新图。
+        now = event.timestamp
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        candidates = []
+        others = []
+        # Names from old history DTOs are legacy usernames, not proof of stable id.
+        conflicting_name = any(
+            isinstance(row, dict) and isinstance(row.get("author"), dict)
+            and (row["author"].get("username") or row["author"].get("name")) == event.user_name
+            and (row["author"].get("id") or row.get("authorId"))
+            and str(row["author"].get("id") or row.get("authorId")) != str(event.user_id or "")
+            for row in body["messages"][:10]
+        )
+        for message in body["messages"][:10]:
+            if not isinstance(message, dict) or not self._image_attachments(message):
+                continue
+            if message.get("channelId") and str(message["channelId"]) != channel_id:
+                continue
+            try:
+                created = datetime.fromisoformat(str(message.get("createdAt") or message.get("timestamp") or "").replace("Z", "+00:00"))
+                age = (now - created).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            if not 0 <= age <= 300 or not message.get("id"):
+                continue
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            aid = str(author.get("id") or message.get("authorId") or "")
+            # Never downgrade a conflicting stable id to a matching display name.
+            same = bool(aid and event.user_id and aid == event.user_id)
+            if not aid:
+                # Legacy username is a stable exact legacy key; display `name` is not.
+                legacy_name = author.get("username")
+                same = bool(legacy_name and event.user_name and legacy_name == event.user_name
+                            and not conflicting_name and author.get("type", "user") == "user")
+            (candidates if same else others).append((created, message))
+        if not candidates:
+            raise ValueError("no_recent_same_sender_image; clarify intended image (others/unknown are not selected)")
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        # Multiple image messages cannot be disambiguated by a generic 'this image'.
+        if len(candidates) != 1:
+            raise ValueError("ambiguous_recent_images; ask which image message")
+        # A name-only/legacy identity cannot safely disambiguate competing authors.
+        chosen = candidates[0][1]
+        author = chosen.get("author") or {}
+        if not (author.get("id") or chosen.get("authorId")) and others:
+            raise ValueError("ambiguous_legacy_author; ask user to reply to image")
+        return chosen
+
+    async def _read_image_body(self, response, budget: list[int]) -> bytes:
+        if response.status_code != 200:
+            raise ValueError(f"attachment_http_{response.status_code}")
+        declared = response.headers.get("content-length")
+        if declared is not None and int(declared) > min(MAX_IMAGE_BYTES, budget[0]):
+            raise ValueError("image_too_large")
+        chunks = []
+        size = 0
+        async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+            size += len(chunk)
+            budget[0] -= len(chunk)
+            if size > MAX_IMAGE_BYTES or budget[0] < 0:
+                raise ValueError("image_byte_budget_exceeded")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def _download_image(self, channel_id: str, message_id: str, attachment: dict, budget: list[int]):
+        index = attachment.get("index")
+        if type(index) is not int or not 0 <= index < MAX_IMAGES or not message_id:
+            raise ValueError("invalid_image_reference")
+        size = attachment.get("size")
+        if size is not None and (type(size) is not int or size < 0 or size > min(MAX_IMAGE_BYTES, budget[0])):
+            raise ValueError("image_too_large")
+        path = (f"/api/v1/channels/{quote(channel_id, safe='')}/messages/"
+                f"{quote(message_id, safe='')}/attachments/{index}")
+        # Only this configured-origin request is authorized with the Bot token.
+        async with self._http.stream(
+            "GET", self._api_base + path,
+            headers={"Authorization": f"Bot {self._bot_token}"},
+            follow_redirects=False, timeout=IMAGE_TIMEOUT_SECONDS,
+        ) as response:
+            if response.status_code != 200:
+                if response.status_code == 401:
+                    await self._fatal_auth()
+                raise ValueError(f"attachment_http_{response.status_code}")
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if content_type == "application/json":
+                # JSON resolver body is bounded too; it is not an event-provided URL.
+                raw = await self._read_image_body(response, [64 * 1024])
+                resolved = json.loads(raw)
+                expiry = resolved.get("expiresIn")
+                if (resolved.get("ok") is not True or type(expiry) not in (int, float)
+                        or not 0 < expiry <= 900):
+                    raise ValueError("missing_or_invalid_signed_url_expiry")
+                url = resolved.get("url")
+                if not isinstance(url, str):
+                    raise ValueError("invalid_signed_url")
+                resolved_size = resolved.get("size")
+                if resolved_size is not None and (type(resolved_size) is not int or resolved_size < 0
+                                                  or resolved_size > min(MAX_IMAGE_BYTES, budget[0])):
+                    raise ValueError("image_too_large")
+                await _validate_image_url(url)
+                async with _open_image_http() as client:
+                    async with client.stream("GET", url, headers={"Accept": "image/*"}, follow_redirects=False) as image:
+                        # All redirects are refused, including public-to-private chains.
+                        data = await self._read_image_body(image, budget)
+            else:
+                data = await self._read_image_body(response, budget)
+        mime = _image_mime(data)
+        from gateway.platforms.base import cache_image_from_bytes_async
+        cached = await cache_image_from_bytes_async(data, _IMAGE_FORMATS[mime])
+        return cached, mime
+
+    async def enrich_mention_event(self, event: MessageEvent, payload: dict) -> MessageEvent:
+        """Async media enrichment; sync event construction remains network-free."""
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        reply = message.get("reply") if isinstance(message.get("reply"), dict) else {}
+        explicit = bool(message.get("attachments") or message.get("hasAttachments") or message.get("attachmentCount"))
+        has_reply = bool(message.get("reply") or message.get("replyToMessageId"))
+        requested = bool(_IMAGE_REFERENCE.search(event.text))
+        images = self._image_attachments(message)
+        target_id = str(message.get("id") or "")
+        origin = "trigger message"
+        if not images and has_reply:
+            images = self._image_attachments(reply)
+            target_id = str(event.reply_to_message_id or "")
+            origin = "replied-to message"
+        if not images and not (requested or explicit or self._image_attachments(reply)):
+            return event
+        try:
+            async def enrich():
+                nonlocal images, target_id, origin
+                _community, channel_id = split_chat_id(event.source.chat_id)
+                if not images and requested and not explicit and not has_reply:
+                    chosen = await self._history_image_message(event, channel_id)
+                    images = self._image_attachments(chosen)
+                    target_id = str(chosen.get("id") or "")
+                    origin = "one recent same-sender channel message"
+                if not images:
+                    raise ValueError("image_metadata_unavailable; no image downloaded")
+                budget = [MAX_IMAGE_TOTAL_BYTES]
+                for attachment in images[:MAX_IMAGES]:
+                    cached, mime = await self._download_image(channel_id, target_id, attachment, budget)
+                    event.media_urls.append(cached)
+                    event.media_types.append(mime)
+                    event.message_type = MessageType.PHOTO
+                self._image_context(event, f"loaded {len(event.media_urls)} image(s) from {origin}"
+                                    + ("; only first 3 images loaded, remaining images unavailable" if len(images) > MAX_IMAGES else ""))
+            await asyncio.wait_for(enrich(), timeout=IMAGE_TIMEOUT_SECONDS)
+        except Exception as exc:
+            # Map known local failures to fixed instructions; never expose raw exception
+            # text, which can contain credential-bearing signed URLs.
+            reason = "unavailable image or ambiguous reference"
+            code = str(exc) if isinstance(exc, ValueError) else ""
+            if code == "attachment_http_403" or code == "naonao http 403":
+                reason = "channel/image permission denied; do not retry via another route"
+            elif code in ("image_too_large", "image_byte_budget_exceeded"):
+                reason = "image size or total byte budget exceeded"
+            elif code in ("unsafe_image_destination", "unsafe_image_url"):
+                reason = "unsafe image destination refused"
+            elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                reason = "image loading timeout"
+            self._image_context(event, f"image loading failed: {reason}; "
+                                f"{len(event.media_urls)} image(s) successfully cached; "
+                                "ask user to specify/reattach, or explain permission/size/network limitations")
+        return event
 
     def build_command_event(self, payload: Dict[str, Any], sequence: Any) -> Optional[MessageEvent]:
         """Turn one NaoNao command.invoked into the plaintext Hermes already parses."""
@@ -1211,7 +1448,6 @@ class NaoNaoAdapter(BasePlatformAdapter):
             source=source,
             message_id=invocation_id or None,
             timestamp=timestamp,
-            channel_prompt=None,
             metadata={
                 "naonao_event_id": event_id,
                 "naonao_sequence": sequence,
@@ -1346,6 +1582,8 @@ class NaoNaoAdapter(BasePlatformAdapter):
             )
             await self._ack(sock, sequence)
             return
+        if event_type == "message.bot_mention":
+            await self.enrich_mention_event(event, data)
         chat_id = event.source.chat_id
         self._event_for_chat[chat_id] = event_id
         logger.info(

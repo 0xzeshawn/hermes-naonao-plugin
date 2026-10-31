@@ -8,6 +8,12 @@
 # Do not set NAONAO_HOME_CHANNEL. Use /sethome in NaoNao.
 # Do not add a bot id, application id, community id, or gateway URL.
 
+# 仅在实际模型端点已验证支持视觉输入时启用。
+# 合并到现有 model 配置，保留 default、provider、base_url 等现有字段。
+# Hermes 的实际能力开关是 model.supports_vision，不是 platforms.naonao 下的字段。
+model:
+  supports_vision: true
+
 platforms:
   naonao:
     enabled: true

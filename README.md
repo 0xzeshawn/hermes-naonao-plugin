@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.3.4**
+**Plugin version: 1.4.0**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.4**.
+Outbound replies are text only. Inbound images (attached to the @mention, attached to the replied-to message, or one unambiguous recent same-sender image when the user explicitly asks) are downloaded through the authorized Bot attachment API and passed to Hermes as native media; set `model.supports_vision: true` in `~/.hermes/config.yaml` for vision-capable models. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.4.0**.
 
 ## What it does
 
@@ -164,8 +164,9 @@ Those values remain valid for config compatibility and do not break gateway star
 | v1.3.2 | Structured reply context mapped to Hermes `reply_to_*` fields |
 | v1.3.3 | Configurable soft response language preference (`zh-CN` / `en` / `auto`) |
 | v1.3.4 | Stop injecting response-language instructions; Hermes follows conversation |
+| v1.4.0 | Inbound image understanding via authorized Bot attachment API (mention / reply / constrained recent history) |
 
-Recommended: **v1.3.4**.
+Recommended: **v1.4.0** (requires a NaoNao backend that serves the Bot attachment endpoint; on older backends images are simply unavailable and text works as before).
 
 ## Upgrade
 

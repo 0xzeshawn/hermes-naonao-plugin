@@ -117,7 +117,7 @@ class ResponseLanguageDeprecatedTest(unittest.TestCase):
 
     def test_schema_keeps_response_language_for_compat(self):
         data = _load_plugin_yaml()
-        self.assertEqual(str(data.get("version")), "1.3.4")
+        self.assertEqual(str(data.get("version")), "1.4.0")
         schema = (data.get("config_schema") or {}).get("response_language") or {}
         self.assertEqual(schema.get("type"), "str")
         self.assertEqual(list(schema.get("choices") or []), ["auto", "zh-CN", "en"])
