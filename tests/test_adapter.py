@@ -207,7 +207,7 @@ class PluginTests(unittest.TestCase):
         self.assertIn("config_schema:", text)
         self.assertIn("response_language:", text)
         self.assertIn("choices: [auto, zh-CN, en]", text)
-        self.assertIn("version: 1.3.4", text)
+        self.assertIn("version: 1.4.0", text)
         self.assertEqual(self.ctx.kwargs["name"], "naonao")
         self.assertEqual(self.ctx.kwargs["required_env"], ["NAONAO_BOT_TOKEN"])
         self.assertEqual(self.ctx.kwargs["allowed_users_env"], "NAONAO_ALLOWED_USERS")

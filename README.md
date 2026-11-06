@@ -2,11 +2,11 @@
 
 NaoNao is a community and channel-based communication platform. This adapter connects a Hermes agent you run yourself to NaoNao channels through the NaoNao Public Bot API and Gateway.
 
-**Plugin version: 1.3.4**
+**Plugin version: 1.4.0**
 
 Hermes replies when someone @mentions your NaoNao bot. You configure one secret, the NaoNao Bot Token. NaoNao does not host Hermes, store your model API key, or pay model usage.
 
-Text messages only. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.3.4**.
+Outbound replies are text only. Inbound images (attached to the @mention, attached to the replied-to message, or one unambiguous recent same-sender image when the user explicitly asks; same-sender is decided only by NaoNao's opaque community- and application-scoped `senderKey`, never by username or account id) are downloaded through the authorized Bot attachment API and passed to Hermes as native media; set `model.supports_vision: true` in `~/.hermes/config.yaml` only after a real vision test has confirmed the model accepts image input. Hermes streams by creating one channel message and PATCHing the same `message.id` until generation finishes. The adapter also provides Typing, a temporary 👀 acknowledgement, and safe Tool Activity categories (no chain-of-thought, no raw tool args). Recommended plugin version: **1.4.0**.
 
 ## What it does
 
@@ -104,7 +104,7 @@ Community owners, for one community:
 Developers who need an Application, commands, publishing, or a team:
 
 1. Open 开发者中心 → 创建应用 → 创建 Bot.
-2. Install the application into a community you manage. Grant 查看频道 and 发送消息 on one text channel.
+2. Install the application into a community you manage. Grant 查看频道 and 发送消息 on one text channel. For image understanding (v1.4.0+), also request and grant 读取历史消息 (`READ_MESSAGE_HISTORY`).
 3. Save the Bot Token.
 
 On that bot, set 运行方式 to 外部机器人. That is the mode this plugin can own. If the bot is still an AI Agent, or external replies are disabled, Hermes will not connect.
@@ -140,18 +140,16 @@ platforms:
 
 ## Response language
 
-The NaoNao plugin does **not** force the agent reply language.
+`response_language` is an optional, **explicit-only** soft preference (1.3.3 behavior, restored in 1.4.0):
 
-Hermes (and the underlying model) chooses the response language from the user's message and conversation context. For example, a Chinese question usually gets a Chinese reply; an English question usually gets an English reply — without Plugin-injected “reply in Chinese/English” instructions.
+| Configured value | Behavior |
+|---|---|
+| `zh-CN` | Adds a soft instruction: default to Simplified Chinese |
+| `en` | Adds a soft instruction: default to English |
+| `auto` | No language instruction; Hermes decides |
+| not configured | No language instruction; Hermes follows the conversation (1.3.4+ behavior) |
 
-### Deprecated setting (ignored)
-
-Older installs may still have:
-
-- `plugins.entries.naonao.settings.response_language` (`zh-CN` / `en` / `auto`)
-- or legacy `platforms.naonao.response_language`
-
-Those values remain valid for config compatibility and do not break gateway startup, but they are **ignored at runtime** since v1.3.4. You can leave them as-is or remove them later.
+It is not a hard lock: an explicit user request for another language still wins. Resolution order: `plugins.entries.naonao.settings.response_language` → legacy `platforms.naonao.response_language` → not configured. The schema default shown in Desktop is UI-only until saved.
 
 ## Version highlights
 
@@ -164,8 +162,9 @@ Those values remain valid for config compatibility and do not break gateway star
 | v1.3.2 | Structured reply context mapped to Hermes `reply_to_*` fields |
 | v1.3.3 | Configurable soft response language preference (`zh-CN` / `en` / `auto`) |
 | v1.3.4 | Stop injecting response-language instructions; Hermes follows conversation |
+| v1.4.0 | Inbound image understanding via authorized Bot attachment API (mention / reply / constrained recent history); explicit `response_language` honored again (unset = Hermes decides) |
 
-Recommended: **v1.3.4**.
+Recommended: **v1.4.0** (requires a NaoNao backend that serves the Bot attachment endpoint; on older backends images are simply unavailable and text works as before).
 
 ## Upgrade
 
@@ -186,6 +185,35 @@ hermes gateway restart
 ```
 
 Symlink installs (`platforms/naonao`) must pull or replace the linked directory yourself, then `hermes gateway restart`.
+
+### Upgrading from 1.3.4 to 1.4.0
+
+1. **Response language behaves differently.** In 1.3.4 the plugin never injected a language instruction. In 1.4.0 an *explicitly saved* `response_language` (`zh-CN` or `en`, in `plugins.entries.naonao.settings` or legacy `platforms.naonao`) is honored again as a soft preference. If you left a value saved from 1.3.3, it takes effect again after upgrading; remove it or set `auto` to keep 1.3.4 behavior. If nothing is saved, behavior is unchanged from 1.3.4.
+2. **Image understanding needs a permission.** The Bot attachment endpoint and the recent-history lookup require 查看频道 + 读取历史消息 (`READ_MESSAGE_HISTORY`) on the channel. Without it, text replies keep working and Hermes is told the image is unavailable (permission denied).
+3. **Image understanding needs a vision model.** Set `model.supports_vision: true` in `~/.hermes/config.yaml` only after confirming the configured model endpoint accepts image input (see `examples/config.yaml.example`). Merge it into your existing `model:` block.
+4. **Images are cached locally.** Downloaded images (max 3 per turn, 10 MiB each, 20 MiB total, PNG/JPEG/GIF/WebP verified by magic bytes) are written to the Hermes image cache through `cache_image_from_bytes_async`, under your Hermes home. Make sure that directory is writable and covered by your retention policy.
+5. **Backend requirement.** Images need a NaoNao backend that serves `GET /api/v1/channels/:channelId/messages/:messageId/attachments/:index`. On older backends images are unavailable; text works as before.
+6. Restart the gateway (`hermes gateway restart`) and run the install verification below; expect `version=1.4.0`.
+
+### Hermes core compatibility
+
+1.4.0 was tested against Hermes Agent commit `a02278293e02640a0e505e8e0841f95dcfc12349`. Image download relies on Hermes internals that are not a stable public API: `tools.url_safety.create_ssrf_safe_async_client` / `_SSRFGuardedAsyncNetworkBackend` and `gateway.platforms.base.cache_image_from_bytes_async`. No minimum Hermes version is declared. On a much older or newer Hermes core, test image input before relying on it; if those internals changed, image loading fails closed (no image is passed to the model) while text replies continue.
+
+### Rolling back to 1.3.4
+
+Pin the install to the `v1.3.4` commit (`--ref` takes a full 40-character commit SHA):
+
+```bash
+hermes plugins remove naonao
+hermes plugins install https://github.com/0xzeshawn/hermes-naonao-plugin.git \
+  --ref 039b9a70602d856b8bc0dea5febcee967aaf3a82
+hermes plugins enable naonao
+hermes gateway restart
+```
+
+A pinned install stays on that commit until you reinstall without `--ref`. If your Hermes CLI has no `--ref`, clone the repository, `git checkout v1.3.4`, and symlink it as described in Install.
+
+Symlink installs: `git checkout v1.3.4` in the linked repository, then `hermes gateway restart`. Optionally set `model.supports_vision` back to its previous value.
 
 ## Enable Hermes streaming
 
@@ -252,7 +280,7 @@ PY
 hermes config get streaming.enabled
 ```
 
-Expect: `version=1.3.2`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
+Expect: `version=1.4.0`, `SUPPORTS_MESSAGE_EDITING=True`, `edit_message=True`, `streaming.enabled=true`.
 
 ## Test with @Bot
 
@@ -333,7 +361,8 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | Safe tool activity states | Supported (v1.3.0+) |
 | Tool status never becomes a Message | Supported (v1.3.1+) |
 | Structured reply context (`reply_to_*`) | Supported (v1.3.2+) |
-| Images, files, voice, video | Not currently supported |
+| Inbound images (mention / reply / one recent same-sender image) | Supported (v1.4.0+; needs `READ_MESSAGE_HISTORY` and a vision model) |
+| Outbound images, files, voice, video | Not currently supported |
 | Ordinary channel messages that do not @ the bot | Not delivered |
 
 - One Hermes profile has one NaoNao home channel.
@@ -348,7 +377,8 @@ The message arrives in the home channel. Cron delivery for this platform uses th
 | `NaoNao Bot is not currently assigned to an external connector` | In the Bot's 运行方式, choose 启用外部机器人. An AI Agent bot will not connect. |
 | The bot never replies, and the gateway log shows the user is unauthorized | Set `NAONAO_ALLOWED_USERS` or `NAONAO_ALLOW_ALL_USERS` as above. |
 | Sending fails with a permissions error | Confirm the app is installed in that community and has 查看频道 and 发送消息 on that channel. |
-| Streaming arrives as one full message | Confirm plugin ≥ `1.1.0` (recommend `1.3.2`), `SUPPORTS_MESSAGE_EDITING=True`, `streaming.enabled=true`, then `hermes gateway restart`. Also confirm the model provider emits deltas. |
+| Hermes says the image is unavailable or permission was denied | Grant 读取历史消息 (`READ_MESSAGE_HISTORY`) together with 查看频道 on that channel, confirm the NaoNao backend serves the Bot attachment endpoint, and confirm `model.supports_vision: true` is set for a vision-capable model. |
+| Streaming arrives as one full message | Confirm plugin ≥ `1.1.0` (recommend `1.4.0`), `SUPPORTS_MESSAGE_EDITING=True`, `streaming.enabled=true`, then `hermes gateway restart`. Also confirm the model provider emits deltas. |
 | Tool status appears as a normal chat message | Upgrade to plugin ≥ **v1.3.1** and restart the gateway. Do not filter message text by emoji or phrase. |
 | Typing or Activity looks stuck | Server TTL clears them (~10s typing / ~12s activity). Check gateway connectivity; sending a Bot message also clears both for that Bot. |
 | No Tool Activity | Confirm Hermes actually invoked a tool. Ordinary generation does not invent Activity. |
@@ -371,12 +401,12 @@ Hermes streaming (config.yaml, not env):
 |---|---|---|
 | `streaming.enabled` | yes | `false` |
 
-NaoNao `response_language` (deprecated, ignored at runtime; config.yaml only):
+NaoNao `response_language` (optional; only applies when explicitly set):
 
 | Key | Required | Notes |
 |---|---|---|
-| `plugins.entries.naonao.settings.response_language` | no | Legacy values `auto` / `zh-CN` / `en` remain valid for config compatibility |
-| `platforms.naonao.response_language` | no | Legacy platform key; also ignored at runtime |
+| `plugins.entries.naonao.settings.response_language` | no | `zh-CN` / `en` / `auto`; wins over the legacy key |
+| `platforms.naonao.response_language` | no | Legacy platform key; used when plugin settings are absent |
 
 Recommended path for other keys: `hermes config set`. Alternative: edit `~/.hermes/.env` / `config.yaml` directly. Do not commit either file.
 
@@ -386,6 +416,8 @@ The adapter uses Public Bot API v1. Production origin is `https://naonaoai.com`.
 
 ```text
 GET    /api/v1/bot/me
+GET    /api/v1/channels/:channelId/messages?limit=10            (READ_MESSAGE_HISTORY)
+GET    /api/v1/channels/:channelId/messages/:messageId/attachments/:index  (READ_MESSAGE_HISTORY)
 POST   /api/v1/bot/gateway-session
 WSS    /gateway/v1
 POST   /api/v1/channels/:channelId/messages
