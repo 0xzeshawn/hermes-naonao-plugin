@@ -1599,7 +1599,14 @@ class NaoNaoAdapter(BasePlatformAdapter):
             event_id, chat_id, event.message_id or "",
         )
         logger.info("[naonao] submitting event to Hermes event_id=%s chat_id=%s", event_id, chat_id)
-        await self.handle_message(event)
+        try:
+            await self.handle_message(event)
+        except Exception:
+            # is_duplicate() claims the id before processing. Release on failure so
+            # Gateway redelivery can retry instead of ACK-only skip.
+            if event_id:
+                self._dedup.discard(event_id)
+            raise
         accepted = bool(getattr(event, "_gateway_accepted", False))
         logger.info(
             "[naonao] Hermes admission result event_id=%s accepted=%s",

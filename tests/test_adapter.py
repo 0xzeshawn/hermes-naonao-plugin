@@ -693,6 +693,30 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("nn_bot_example", text)
         await adapter.disconnect()
 
+    async def test_handle_message_failure_releases_dedup_for_retry(self):
+        """Processing exception must discard event_id so Gateway redelivery can retry."""
+        adapter = self._adapter(_ok_api(), [])
+        sock = _Socket([], hold=True)
+        calls = {"n": 0}
+
+        async def boom(event):
+            calls["n"] += 1
+            raise RuntimeError("agent crashed")
+
+        adapter.handle_message = boom
+        frame = {"op": "EVENT", "v": 1, "s": 11, "t": "message.bot_mention", "d": _mention(event_id="evt_boom")}
+        with self.assertLogs("naonao_platform_adapter", level="INFO"):
+            with self.assertRaises(RuntimeError):
+                await adapter._on_event(sock, frame)
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(any(frame.get("op") == "ACK" for frame in sock.sent))
+        self.assertFalse(adapter._dedup.contains("evt_boom"))
+        # Same event_id on redelivery must not be treated as a duplicate.
+        with self.assertLogs("naonao_platform_adapter", level="INFO"):
+            with self.assertRaises(RuntimeError):
+                await adapter._on_event(sock, frame)
+        self.assertEqual(calls["n"], 2)
+
     async def test_outbound_failure_log_redacts_secrets(self):
         adapter = self._adapter(_ok_api(reply_status=403, reply_err="nn_bot_example leaked"), [])
         adapter._http = _Http(_ok_api(reply_status=403, reply_err="nn_bot_example leaked"))
