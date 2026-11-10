@@ -207,7 +207,7 @@ class PluginTests(unittest.TestCase):
         self.assertIn("config_schema:", text)
         self.assertIn("response_language:", text)
         self.assertIn("choices: [auto, zh-CN, en]", text)
-        self.assertIn("version: 1.3.4", text)
+        self.assertIn("version: 1.4.0", text)
         self.assertEqual(self.ctx.kwargs["name"], "naonao")
         self.assertEqual(self.ctx.kwargs["required_env"], ["NAONAO_BOT_TOKEN"])
         self.assertEqual(self.ctx.kwargs["allowed_users_env"], "NAONAO_ALLOWED_USERS")
@@ -656,7 +656,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mention accepted event_id=evt_1 chat_id=community_a:channel_x message_id=msg_1", text)
         self.assertIn("submitting event to Hermes event_id=evt_1 chat_id=community_a:channel_x", text)
         self.assertIn("Hermes admission result event_id=evt_1 accepted=true", text)
-        self.assertIn("acking event event_id=evt_1 sequence=4", text)
+        self.assertIn("acking event event_id=evt_1 sequence=4 accepted=true", text)
         self.assertIn("skipping malformed or foreign mention event_id=evt_bad sequence=6", text)
         self.assertIn("outbound send start chat_id=community_a:channel_x event_id=evt_1", text)
         self.assertIn("outbound send success chat_id=community_a:channel_x message_id=sent_1", text)
@@ -668,7 +668,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Hermes reply", text)
         await adapter.disconnect()
 
-    async def test_unaccepted_event_is_not_acked(self):
+    async def test_unaccepted_event_is_still_acked(self):
+        """accepted=false (e.g. /new) still ACKs so Gateway contiguous watermark cannot stall."""
         sock = _Socket([
             {"op": "HELLO", "v": 1, "d": {"heartbeatIntervalMs": 60000}},
             {"op": "READY", "v": 1, "d": {"sessionId": "sess_1", "resumeToken": "nn_gwr_example", "resumeExpiresAt": "2099-01-01T00:00:00+00:00", "startSequence": 0}},
@@ -682,13 +683,40 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message = reject
         with self.assertLogs("naonao_platform_adapter", level="INFO") as captured:
             self.assertTrue(await adapter.connect())
-            await asyncio.wait_for(self._until(lambda: any("accepted=false" in line for line in captured.output)), 2)
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(
+                self._until(lambda: any(frame.get("op") == "ACK" and frame.get("d", {}).get("sequence") == 9 for frame in sock.sent)),
+                2,
+            )
         text = "\n".join(captured.output)
-        self.assertIn("event not accepted by Hermes event_id=evt_reject sequence=9", text)
-        self.assertFalse(any(frame.get("op") == "ACK" for frame in sock.sent))
+        self.assertIn("Hermes admission result event_id=evt_reject accepted=false", text)
+        self.assertIn("acking event event_id=evt_reject sequence=9 accepted=false", text)
+        self.assertTrue(any(frame.get("op") == "ACK" and frame.get("d", {}).get("sequence") == 9 for frame in sock.sent))
         self.assertNotIn("nn_bot_example", text)
         await adapter.disconnect()
+
+    async def test_handle_message_failure_releases_dedup_for_retry(self):
+        """Processing exception must discard event_id so Gateway redelivery can retry."""
+        adapter = self._adapter(_ok_api(), [])
+        sock = _Socket([], hold=True)
+        calls = {"n": 0}
+
+        async def boom(event):
+            calls["n"] += 1
+            raise RuntimeError("agent crashed")
+
+        adapter.handle_message = boom
+        frame = {"op": "EVENT", "v": 1, "s": 11, "t": "message.bot_mention", "d": _mention(event_id="evt_boom")}
+        with self.assertLogs("naonao_platform_adapter", level="INFO"):
+            with self.assertRaises(RuntimeError):
+                await adapter._on_event(sock, frame)
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(any(frame.get("op") == "ACK" for frame in sock.sent))
+        self.assertFalse(adapter._dedup.contains("evt_boom"))
+        # Same event_id on redelivery must not be treated as a duplicate.
+        with self.assertLogs("naonao_platform_adapter", level="INFO"):
+            with self.assertRaises(RuntimeError):
+                await adapter._on_event(sock, frame)
+        self.assertEqual(calls["n"], 2)
 
     async def test_outbound_failure_log_redacts_secrets(self):
         adapter = self._adapter(_ok_api(reply_status=403, reply_err="nn_bot_example leaked"), [])
